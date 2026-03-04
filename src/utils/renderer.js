@@ -769,6 +769,11 @@ ipcRenderer.on('clear-sensitive-data', async () => {
     await storage.clearAll();
 });
 
+ipcRenderer.on('auto-capture-screenshot', async (event, { transcription }) => {
+    console.log('[auto-screenshot] Triggered by voice:', transcription?.substring(0, 60));
+    await captureManualScreenshot();
+});
+
 // Handle shortcuts based on current view
 function handleShortcut(shortcutKey) {
     const currentView = cheatingDaddy.getCurrentView();
