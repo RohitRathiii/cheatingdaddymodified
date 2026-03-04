@@ -50,6 +50,21 @@ let messageBuffer = '';
 let geminiSendLock = false;
 let geminiAudioQueue = [];
 
+// Silence-based dispatch: fire Groq/Gemma as soon as user stops speaking
+// rather than waiting for Gemini to finish generating its audio response
+const SILENCE_TIMEOUT_MS = 800;
+let transcriptionSilenceTimer = null;
+
+// Groq Whisper VAD state
+const WHISPER_SILENCE_THRESHOLD = 0.008; // RMS energy below this = silence
+const WHISPER_SPEECH_START_FRAMES = 3;   // consecutive speech frames to start recording
+const WHISPER_SILENCE_END_FRAMES = 10;   // consecutive silence frames (~1s) to end utterance
+const WHISPER_PRE_BUFFER_FRAMES = 5;     // frames before speech start to include
+let whisperIsSpeaking = false;
+let whisperSpeechFrames = 0;
+let whisperSilenceFrames = 0;
+let whisperAudioBuffer = [];    // Buffers during active speech
+let whisperPreBuffer = [];      // Rolling pre-speech buffer (last N frames)
 
 // Reconnection variables
 let isUserClosing = false;
@@ -428,6 +443,136 @@ async function sendToGemma(transcription) {
     }
 }
 
+function dispatchTranscription() {
+    if (currentTranscription.trim() === '') return;
+    const text = currentTranscription;
+    currentTranscription = '';
+    console.log('[silence-dispatch] Firing Groq/Gemma after silence timeout');
+    if (hasGroqKey()) {
+        sendToGroq(text);
+    } else {
+        sendToGemma(text);
+    }
+}
+
+function resetTranscriptionSilenceTimer() {
+    clearTranscriptionSilenceTimer();
+    transcriptionSilenceTimer = setTimeout(dispatchTranscription, SILENCE_TIMEOUT_MS);
+}
+
+function clearTranscriptionSilenceTimer() {
+    if (transcriptionSilenceTimer) {
+        clearTimeout(transcriptionSilenceTimer);
+        transcriptionSilenceTimer = null;
+    }
+}
+
+function createWavBuffer(pcmBuffer, sampleRate = 24000) {
+    const numChannels = 1, bitsPerSample = 16;
+    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+    const blockAlign = numChannels * (bitsPerSample / 8);
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(pcmBuffer.length + 36, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(numChannels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(pcmBuffer.length, 40);
+    return Buffer.concat([header, pcmBuffer]);
+}
+
+async function transcribeWithGroqWhisper(pcmBuffer) {
+    const groqApiKey = getGroqApiKey();
+    if (!groqApiKey) return '';
+    try {
+        const wavBuffer = createWavBuffer(pcmBuffer);
+        const formData = new FormData();
+        formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
+        formData.append('model', 'whisper-large-v3-turbo');
+        formData.append('response_format', 'text');
+        const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${groqApiKey}` },
+            body: formData,
+        });
+        if (!response.ok) {
+            console.error('Groq Whisper error:', response.status, await response.text());
+            return '';
+        }
+        const text = (await response.text()).trim();
+        console.log('[whisper] Transcribed:', text.substring(0, 80));
+        return text;
+    } catch (err) {
+        console.error('Groq Whisper exception:', err);
+        return '';
+    }
+}
+
+function resetWhisperVadState() {
+    whisperIsSpeaking = false;
+    whisperSpeechFrames = 0;
+    whisperSilenceFrames = 0;
+    whisperAudioBuffer = [];
+    whisperPreBuffer = [];
+}
+
+async function processAudioForWhisper(monoChunk) {
+    // Calculate RMS energy of this chunk
+    let sum = 0;
+    for (let i = 0; i < monoChunk.length - 1; i += 2) {
+        const s = monoChunk.readInt16LE(i) / 32768.0;
+        sum += s * s;
+    }
+    const rms = Math.sqrt(sum / (monoChunk.length / 2));
+    const isSpeech = rms > WHISPER_SILENCE_THRESHOLD;
+
+    // Maintain pre-speech rolling buffer
+    whisperPreBuffer.push(monoChunk);
+    if (whisperPreBuffer.length > WHISPER_PRE_BUFFER_FRAMES) {
+        whisperPreBuffer.shift();
+    }
+
+    if (isSpeech) {
+        whisperSpeechFrames++;
+        whisperSilenceFrames = 0;
+        if (!whisperIsSpeaking && whisperSpeechFrames >= WHISPER_SPEECH_START_FRAMES) {
+            whisperIsSpeaking = true;
+            // Include pre-buffer frames so we don't cut off utterance start
+            whisperAudioBuffer = [...whisperPreBuffer];
+            sendToRenderer('update-status', 'Transcribing...');
+        }
+    } else {
+        whisperSilenceFrames++;
+        whisperSpeechFrames = 0;
+    }
+
+    if (whisperIsSpeaking) {
+        if (isSpeech) whisperAudioBuffer.push(monoChunk);
+
+        if (!isSpeech && whisperSilenceFrames >= WHISPER_SILENCE_END_FRAMES) {
+            // End of utterance — send to Whisper
+            whisperIsSpeaking = false;
+            const utterancePcm = Buffer.concat(whisperAudioBuffer);
+            whisperAudioBuffer = [];
+            whisperSpeechFrames = 0;
+            whisperSilenceFrames = 0;
+
+            const transcription = await transcribeWithGroqWhisper(utterancePcm);
+            if (transcription.trim()) {
+                sendToGroq(transcription);
+            }
+            sendToRenderer('update-status', 'Listening...');
+        }
+    }
+}
+
 async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US', isReconnect = false) {
     if (isInitializingSession) {
         console.log('Session initialization already in progress');
@@ -465,7 +610,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
     try {
         const session = await client.live.connect({
-            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            model: 'gemini-2.5-flash-native-audio-preview-12-2025',
             callbacks: {
                 onopen: function () {
                     sendToRenderer('update-status', 'Live session connected');
@@ -476,10 +621,12 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     // Handle input transcription (what was spoken)
                     if (message.serverContent?.inputTranscription?.results) {
                         currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
+                        resetTranscriptionSilenceTimer();
                     } else if (message.serverContent?.inputTranscription?.text) {
                         const text = message.serverContent.inputTranscription.text;
                         if (text.trim() !== '') {
                             currentTranscription += text;
+                            resetTranscriptionSilenceTimer();
                         }
                     }
 
@@ -491,7 +638,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
 
                     if (message.serverContent?.turnComplete) {
+                        // Silence timer already dispatched to Groq/Gemma; just clean up and update status
+                        clearTranscriptionSilenceTimer();
                         if (currentTranscription.trim() !== '') {
+                            // Fallback: dispatch if silence timer somehow missed it
                             if (hasGroqKey()) {
                                 sendToGroq(currentTranscription);
                             } else {
@@ -529,12 +679,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 proactivity: { proactiveAudio: true },
                 outputAudioTranscription: {},
                 tools: enabledTools,
-                // Enable speaker diarization
-                inputAudioTranscription: {
-                    enableSpeakerDiarization: true,
-                    minSpeakerCount: 2,
-                    maxSpeakerCount: 2,
-                },
+                inputAudioTranscription: {},
                 contextWindowCompression: { slidingWindow: {} },
                 speechConfig: { languageCode: language },
                 systemInstruction: {
@@ -565,6 +710,8 @@ async function attemptReconnect() {
     // Clear stale buffers
     messageBuffer = '';
     currentTranscription = '';
+    clearTranscriptionSilenceTimer();
+    resetWhisperVadState();
     // Don't reset groqConversationHistory to preserve context across reconnects
 
     sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
@@ -707,6 +854,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
                 sendCloudAudio(monoChunk);
             } else if (currentProviderMode === 'local') {
                 getLocalAi().processLocalAudio(monoChunk);
+            } else if (currentProviderMode === 'byok' && hasGroqKey()) {
+                processAudioForWhisper(monoChunk);
             } else {
                 const base64Data = monoChunk.toString('base64');
                 geminiAudioQueue.push(base64Data);
@@ -764,6 +913,7 @@ function stopMacOSAudioCapture() {
     }
     geminiAudioQueue = [];
     geminiSendLock = false;
+    resetWhisperVadState();
 }
 
 async function drainGeminiQueue(geminiSessionRef) {
@@ -838,6 +988,17 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
         console.log(`Image response completed from ${model}`);
 
+        // Inject screen analysis into Groq context for follow-up voice questions
+        if (fullText.trim()) {
+            groqConversationHistory.push({
+                role: 'user',
+                content: `[Screen context]: ${fullText.trim()}`
+            });
+            if (groqConversationHistory.length > 20) {
+                groqConversationHistory = groqConversationHistory.slice(-20);
+            }
+        }
+
         // Save screen analysis to history
         saveScreenAnalysis(prompt, fullText, model);
 
@@ -873,6 +1034,19 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US') => {
         currentProviderMode = 'byok';
+
+        // When Groq key is present, use Groq Whisper for transcription — no Gemini Live needed
+        if (hasGroqKey()) {
+            const enabledTools = await getEnabledTools();
+            const googleSearchEnabled = enabledTools.some(t => t.googleSearch);
+            currentSystemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+            initializeNewSession(profile, customPrompt);
+            resetWhisperVadState();
+            console.log('Groq BYOK: using Groq Whisper for transcription, skipping Gemini Live');
+            return true;
+        }
+
+        // No Groq key — use Gemini Live for transcription (Gemma path)
         const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
         if (session) {
             geminiSessionRef.current = session;
@@ -911,6 +1085,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return { success: false, error: error.message };
             }
         }
+        // Groq BYOK: route to Whisper VAD instead of Gemini Live
+        if (currentProviderMode === 'byok' && hasGroqKey()) {
+            const pcmBuffer = Buffer.from(data, 'base64');
+            processAudioForWhisper(pcmBuffer);
+            return { success: true };
+        }
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
         try {
             process.stdout.write('.');
@@ -945,6 +1125,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 console.error('Error sending local mic audio:', error);
                 return { success: false, error: error.message };
             }
+        }
+        // Groq BYOK: route to Whisper VAD instead of Gemini Live
+        if (currentProviderMode === 'byok' && hasGroqKey()) {
+            const pcmBuffer = Buffer.from(data, 'base64');
+            processAudioForWhisper(pcmBuffer);
+            return { success: true };
         }
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
         try {
@@ -1023,18 +1209,19 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
         }
 
+        // Groq BYOK: send directly without requiring a Gemini session
+        if (currentProviderMode === 'byok' && hasGroqKey()) {
+            sendToGroq(text.trim());
+            return { success: true };
+        }
+
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
 
         try {
             console.log('Sending text message:', text);
 
-            if (hasGroqKey()) {
-                sendToGroq(text.trim());
-                return { success: true };
-            } else {
-                sendToGemma(text.trim());
-                return { success: true };
-            }
+            sendToGemma(text.trim());
+            return { success: true };
         } catch (error) {
             console.error('Error sending text:', error);
             return { success: false, error: error.message };
@@ -1087,6 +1274,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             // Set flag to prevent reconnection attempts
             isUserClosing = true;
             sessionParams = null;
+            clearTranscriptionSilenceTimer();
+            resetWhisperVadState();
 
             // Cleanup session
             if (geminiSessionRef.current) {
