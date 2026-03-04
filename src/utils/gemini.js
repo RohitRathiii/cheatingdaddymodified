@@ -33,7 +33,7 @@ function formatSpeakerResults(results) {
     let text = '';
     for (const result of results) {
         if (result.transcript && result.speakerId) {
-            const speakerLabel = result.speakerId === 1 ? 'Interviewer' : 'Candidate';
+            const speakerLabel = `Speaker ${result.speakerId}`;
             text += `[${speakerLabel}]: ${result.transcript}\n`;
         }
     }
@@ -45,6 +45,10 @@ module.exports.formatSpeakerResults = formatSpeakerResults;
 // Audio capture variables
 let systemAudioProc = null;
 let messageBuffer = '';
+
+// Gemini audio send serialization
+let geminiSendLock = false;
+let geminiAudioQueue = [];
 
 
 // Reconnection variables
@@ -171,9 +175,6 @@ async function getStoredSetting(key, defaultValue) {
     try {
         const windows = BrowserWindow.getAllWindows();
         if (windows.length > 0) {
-            // Wait a bit for the renderer to be ready
-            await new Promise(resolve => setTimeout(resolve, 100));
-
             // Try to get setting from renderer process localStorage
             const value = await windows[0].webContents.executeJavaScript(`
                 (function() {
@@ -486,6 +487,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     // if (message.serverContent?.outputTranscription?.text) { ... }
 
                     if (message.serverContent?.generationComplete) {
+                        messageBuffer = '';
+                    }
+
+                    if (message.serverContent?.turnComplete) {
                         if (currentTranscription.trim() !== '') {
                             if (hasGroqKey()) {
                                 sendToGroq(currentTranscription);
@@ -494,10 +499,6 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                             }
                             currentTranscription = '';
                         }
-                        messageBuffer = '';
-                    }
-
-                    if (message.serverContent?.turnComplete) {
                         sendToRenderer('update-status', 'Listening...');
                     }
                 },
@@ -708,7 +709,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
                 getLocalAi().processLocalAudio(monoChunk);
             } else {
                 const base64Data = monoChunk.toString('base64');
-                sendAudioToGemini(base64Data, geminiSessionRef);
+                geminiAudioQueue.push(base64Data);
+                drainGeminiQueue(geminiSessionRef);
             }
 
             if (process.env.DEBUG_AUDIO) {
@@ -745,8 +747,10 @@ function convertStereoToMono(stereoBuffer) {
     const monoBuffer = Buffer.alloc(samples * 2);
 
     for (let i = 0; i < samples; i++) {
-        const leftSample = stereoBuffer.readInt16LE(i * 4);
-        monoBuffer.writeInt16LE(leftSample, i * 2);
+        const leftSample  = stereoBuffer.readInt16LE(i * 4);
+        const rightSample = stereoBuffer.readInt16LE(i * 4 + 2);
+        const mono = Math.round((leftSample + rightSample) / 2);
+        monoBuffer.writeInt16LE(Math.max(-32768, Math.min(32767, mono)), i * 2);
     }
 
     return monoBuffer;
@@ -758,6 +762,18 @@ function stopMacOSAudioCapture() {
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
+    geminiAudioQueue = [];
+    geminiSendLock = false;
+}
+
+async function drainGeminiQueue(geminiSessionRef) {
+    if (geminiSendLock) return;
+    geminiSendLock = true;
+    while (geminiAudioQueue.length > 0) {
+        const base64Data = geminiAudioQueue.shift();
+        await sendAudioToGemini(base64Data, geminiSessionRef);
+    }
+    geminiSendLock = false;
 }
 
 async function sendAudioToGemini(base64Data, geminiSessionRef) {
@@ -1014,12 +1030,11 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
             if (hasGroqKey()) {
                 sendToGroq(text.trim());
+                return { success: true };
             } else {
                 sendToGemma(text.trim());
+                return { success: true };
             }
-
-            await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
-            return { success: true };
         } catch (error) {
             console.error('Error sending text:', error);
             return { success: false, error: error.message };
