@@ -8,8 +8,10 @@ let audioProcessor = null;
 let micAudioProcessor = null;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
-const AUDIO_CHUNK_DURATION = 0.1; // seconds
+const AUDIO_CHUNK_DURATION = 0.04; // seconds — Live API prefers 20–40ms chunks
 const BUFFER_SIZE = 4096; // Increased buffer size for smoother audio
+const SCREENSHOT_MAX_WIDTH = 1280;
+const SCREENSHOT_MIN_INTERVAL_MS = 1000;
 
 let hiddenVideo = null;
 let offscreenCanvas = null;
@@ -106,7 +108,7 @@ const storage = {
     async getTodayLimits() {
         const result = await ipcRenderer.invoke('storage:get-today-limits');
         return result.success ? result.data : { flash: { count: 0 }, flashLite: { count: 0 } };
-    }
+    },
 };
 
 // Cache for preferences to avoid async calls in hot paths
@@ -384,10 +386,12 @@ function setupLinuxMicProcessing(micStream) {
             const pcmData16 = convertFloat32ToInt16(chunk);
             const base64Data = arrayBufferToBase64(pcmData16.buffer);
 
-            await ipcRenderer.invoke('send-mic-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            ipcRenderer
+                .invoke('send-mic-audio-content', {
+                    data: base64Data,
+                    mimeType: 'audio/pcm;rate=24000',
+                })
+                .catch(err => console.error('Failed to send mic audio:', err));
         }
     };
 
@@ -417,10 +421,12 @@ function setupLinuxSystemAudioProcessing() {
             const pcmData16 = convertFloat32ToInt16(chunk);
             const base64Data = arrayBufferToBase64(pcmData16.buffer);
 
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            ipcRenderer
+                .invoke('send-audio-content', {
+                    data: base64Data,
+                    mimeType: 'audio/pcm;rate=24000',
+                })
+                .catch(err => console.error('Failed to send system audio:', err));
         }
     };
 
@@ -447,10 +453,12 @@ function setupWindowsLoopbackProcessing() {
             const pcmData16 = convertFloat32ToInt16(chunk);
             const base64Data = arrayBufferToBase64(pcmData16.buffer);
 
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            ipcRenderer
+                .invoke('send-audio-content', {
+                    data: base64Data,
+                    mimeType: 'audio/pcm;rate=24000',
+                })
+                .catch(err => console.error('Failed to send system audio:', err));
         }
     };
 
@@ -458,204 +466,161 @@ function setupWindowsLoopbackProcessing() {
     audioProcessor.connect(audioContext.destination);
 }
 
-async function captureScreenshot(imageQuality = 'medium', isManual = false) {
-    console.log(`Capturing ${isManual ? 'manual' : 'automated'} screenshot...`);
-    if (!mediaStream) return;
-
-    // Lazy init of video element
-    if (!hiddenVideo) {
-        hiddenVideo = document.createElement('video');
-        hiddenVideo.srcObject = mediaStream;
-        hiddenVideo.muted = true;
-        hiddenVideo.playsInline = true;
-        await hiddenVideo.play();
-
-        await new Promise(resolve => {
-            if (hiddenVideo.readyState >= 2) return resolve();
-            hiddenVideo.onloadedmetadata = () => resolve();
-        });
-
-        // Lazy init of canvas based on video dimensions
-        offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = hiddenVideo.videoWidth;
-        offscreenCanvas.height = hiddenVideo.videoHeight;
-        offscreenContext = offscreenCanvas.getContext('2d');
-    }
-
-    // Check if video is ready
-    if (hiddenVideo.readyState < 2) {
-        console.warn('Video not ready yet, skipping screenshot');
-        return;
-    }
-
-    offscreenContext.drawImage(hiddenVideo, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
-
-    // Check if image was drawn properly by sampling a pixel
-    const imageData = offscreenContext.getImageData(0, 0, 1, 1);
-    const isBlank = imageData.data.every((value, index) => {
-        // Check if all pixels are black (0,0,0) or transparent
-        return index === 3 ? true : value === 0;
-    });
-
-    if (isBlank) {
-        console.warn('Screenshot appears to be blank/black');
-    }
-
-    let qualityValue;
-    switch (imageQuality) {
-        case 'high':
-            qualityValue = 0.9;
-            break;
-        case 'medium':
-            qualityValue = 0.7;
-            break;
-        case 'low':
-            qualityValue = 0.5;
-            break;
-        default:
-            qualityValue = 0.7; // Default to medium
-    }
-
-    offscreenCanvas.toBlob(
-        async blob => {
-            if (!blob) {
-                console.error('Failed to create blob from canvas');
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const base64data = reader.result.split(',')[1];
-
-                // Validate base64 data
-                if (!base64data || base64data.length < 100) {
-                    console.error('Invalid base64 data generated');
-                    return;
-                }
-
-                const result = await ipcRenderer.invoke('send-image-content', {
-                    data: base64data,
-                });
-
-                if (result.success) {
-                    console.log(`Image sent successfully (${offscreenCanvas.width}x${offscreenCanvas.height})`);
-                } else {
-                    console.error('Failed to send image:', result.error);
-                }
-            };
-            reader.readAsDataURL(blob);
-        },
-        'image/jpeg',
-        qualityValue
-    );
-}
-
 const MANUAL_SCREENSHOT_PROMPT = `Help me on this page, give me the answer no bs, complete answer.
 So if its a code question, give me the approach in few bullet points, then the entire code. Also if theres anything else i need to know, tell me.
 If its a question about the website, give me the answer no bs, complete answer.
 If its a mcq question, give me the answer no bs, complete answer.`;
 
-async function captureManualScreenshot(imageQuality = null) {
-    console.log('Manual screenshot triggered');
-    const quality = imageQuality || currentImageQuality;
+let screenshotSendInFlight = false;
+let pendingScreenshotJob = null;
+let lastScreenshotSentAt = 0;
 
+function jpegQualityValue(quality) {
+    switch (quality) {
+        case 'high':
+            return 0.85;
+        case 'low':
+            return 0.4;
+        case 'medium':
+        default:
+            return 0.6;
+    }
+}
+
+async function ensureScreenshotVideo() {
     if (!mediaStream) {
         console.error('No media stream available');
-        return;
+        return false;
     }
 
-    // Lazy init of video element
     if (!hiddenVideo) {
         hiddenVideo = document.createElement('video');
         hiddenVideo.srcObject = mediaStream;
         hiddenVideo.muted = true;
         hiddenVideo.playsInline = true;
         await hiddenVideo.play();
-
         await new Promise(resolve => {
             if (hiddenVideo.readyState >= 2) return resolve();
             hiddenVideo.onloadedmetadata = () => resolve();
         });
-
-        // Lazy init of canvas based on video dimensions
         offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = hiddenVideo.videoWidth;
-        offscreenCanvas.height = hiddenVideo.videoHeight;
         offscreenContext = offscreenCanvas.getContext('2d');
     }
 
-    // Check if video is ready
     if (hiddenVideo.readyState < 2) {
         console.warn('Video not ready yet, skipping screenshot');
-        return;
+        return false;
     }
+    return true;
+}
 
-    // Downscale to max 1280px wide for faster transfer — vision models don't need 4K
-    const MAX_WIDTH = 1280;
+function arrayBufferToJpegBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+}
+
+function encodeScreenshotJpeg(quality) {
     const srcW = hiddenVideo.videoWidth;
     const srcH = hiddenVideo.videoHeight;
     let destW = srcW;
     let destH = srcH;
-    if (srcW > MAX_WIDTH) {
-        destW = MAX_WIDTH;
-        destH = Math.round(srcH * (MAX_WIDTH / srcW));
+    if (srcW > SCREENSHOT_MAX_WIDTH) {
+        destW = SCREENSHOT_MAX_WIDTH;
+        destH = Math.round(srcH * (SCREENSHOT_MAX_WIDTH / srcW));
     }
     offscreenCanvas.width = destW;
     offscreenCanvas.height = destH;
     offscreenContext.drawImage(hiddenVideo, 0, 0, destW, destH);
 
-    let qualityValue;
-    switch (quality) {
-        case 'high':
-            qualityValue = 0.85;
-            break;
-        case 'medium':
-            qualityValue = 0.6;
-            break;
-        case 'low':
-            qualityValue = 0.4;
-            break;
-        default:
-            qualityValue = 0.6;
-    }
-
-    offscreenCanvas.toBlob(
-        async blob => {
-            if (!blob) {
-                console.error('Failed to create blob from canvas');
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const base64data = reader.result.split(',')[1];
-
-                if (!base64data || base64data.length < 100) {
-                    console.error('Invalid base64 data generated');
+    return new Promise((resolve, reject) => {
+        offscreenCanvas.toBlob(
+            async blob => {
+                if (!blob) {
+                    reject(new Error('Failed to create blob from canvas'));
                     return;
                 }
-
-                console.log(`Sending image: ${destW}x${destH}, ~${Math.round(base64data.length / 1024)}KB`);
-
-                // Send image with prompt to HTTP API (response streams via IPC events)
-                const result = await ipcRenderer.invoke('send-image-content', {
-                    data: base64data,
-                    prompt: MANUAL_SCREENSHOT_PROMPT,
-                });
-
-                if (result.success) {
-                    console.log(`Image response completed from ${result.model}`);
-                    // Response already displayed via streaming events (new-response/update-response)
-                } else {
-                    console.error('Failed to get image response:', result.error);
-                    cheatingDaddy.addNewResponse(`Error: ${result.error}`);
+                try {
+                    const base64data = arrayBufferToJpegBase64(await blob.arrayBuffer());
+                    if (!base64data || base64data.length < 100) {
+                        reject(new Error('Invalid JPEG data generated'));
+                        return;
+                    }
+                    resolve({ data: base64data, width: destW, height: destH });
+                } catch (error) {
+                    reject(error);
                 }
-            };
-            reader.readAsDataURL(blob);
-        },
-        'image/jpeg',
-        qualityValue
-    );
+            },
+            'image/jpeg',
+            jpegQualityValue(quality)
+        );
+    });
+}
+
+async function flushPendingScreenshot() {
+    if (screenshotSendInFlight || !pendingScreenshotJob) return;
+
+    const elapsed = Date.now() - lastScreenshotSentAt;
+    if (lastScreenshotSentAt && elapsed < SCREENSHOT_MIN_INTERVAL_MS) {
+        setTimeout(() => flushPendingScreenshot(), SCREENSHOT_MIN_INTERVAL_MS - elapsed);
+        return;
+    }
+
+    screenshotSendInFlight = true;
+    const { prompt, quality } = pendingScreenshotJob;
+    pendingScreenshotJob = null;
+
+    try {
+        const ready = await ensureScreenshotVideo();
+        if (!ready) return;
+        const encoded = await encodeScreenshotJpeg(quality);
+        lastScreenshotSentAt = Date.now();
+        console.log(`Sending screenshot: ${encoded.width}x${encoded.height}, ~${Math.round(encoded.data.length / 1024)}KB`);
+        const result = await ipcRenderer.invoke('send-image-content', {
+            data: encoded.data,
+            prompt,
+            mimeType: 'image/jpeg',
+        });
+        if (!result.success) {
+            console.error('Failed to send screenshot:', result.error);
+            if (typeof cheatingDaddy !== 'undefined' && cheatingDaddy.addNewResponse) {
+                cheatingDaddy.addNewResponse(`Error: ${result.error}`);
+            }
+        }
+    } catch (error) {
+        console.error('Screenshot capture failed:', error);
+    } finally {
+        screenshotSendInFlight = false;
+        if (pendingScreenshotJob) {
+            flushPendingScreenshot();
+        }
+    }
+}
+
+function queueScreenshot({ prompt = MANUAL_SCREENSHOT_PROMPT, quality = currentImageQuality } = {}) {
+    pendingScreenshotJob = { prompt, quality };
+    flushPendingScreenshot();
+}
+
+async function captureScreenshot(imageQuality = 'medium', isManual = false) {
+    console.log(`Capturing ${isManual ? 'manual' : 'automated'} screenshot...`);
+    queueScreenshot({
+        prompt: MANUAL_SCREENSHOT_PROMPT,
+        quality: imageQuality,
+    });
+}
+
+async function captureManualScreenshot(imageQuality = null, extraContext = '') {
+    console.log('Manual screenshot triggered');
+    const prompt = extraContext ? `${MANUAL_SCREENSHOT_PROMPT}\n\nSpoken request: ${extraContext}` : MANUAL_SCREENSHOT_PROMPT;
+    queueScreenshot({
+        prompt,
+        quality: imageQuality || currentImageQuality,
+    });
 }
 
 // Expose functions to global scope for external access
@@ -741,7 +706,7 @@ ipcRenderer.on('save-session-context', async (event, data) => {
     try {
         await storage.saveSession(data.sessionId, {
             profile: data.profile,
-            customPrompt: data.customPrompt
+            customPrompt: data.customPrompt,
         });
         console.log('Session context saved:', data.sessionId, 'profile:', data.profile);
     } catch (error) {
@@ -755,7 +720,7 @@ ipcRenderer.on('save-screen-analysis', async (event, data) => {
         await storage.saveSession(data.sessionId, {
             screenAnalysisHistory: data.fullHistory,
             profile: data.profile,
-            customPrompt: data.customPrompt
+            customPrompt: data.customPrompt,
         });
         console.log('Screen analysis saved:', data.sessionId);
     } catch (error) {
@@ -771,7 +736,7 @@ ipcRenderer.on('clear-sensitive-data', async () => {
 
 ipcRenderer.on('auto-capture-screenshot', async (event, { transcription }) => {
     console.log('[auto-screenshot] Triggered by voice:', transcription?.substring(0, 60));
-    await captureManualScreenshot();
+    await captureManualScreenshot(null, transcription);
 });
 
 // Handle shortcuts based on current view
@@ -795,75 +760,129 @@ const theme = {
     themes: {
         dark: {
             background: '#101010',
-            text: '#e0e0e0', textSecondary: '#a0a0a0', textMuted: '#6b6b6b',
-            border: '#2a2a2a', accent: '#ffffff',
-            btnPrimaryBg: '#ffffff', btnPrimaryText: '#000000', btnPrimaryHover: '#e0e0e0',
-            tooltipBg: '#1a1a1a', tooltipText: '#ffffff',
-            keyBg: 'rgba(255,255,255,0.1)'
+            text: '#e0e0e0',
+            textSecondary: '#a0a0a0',
+            textMuted: '#6b6b6b',
+            border: '#2a2a2a',
+            accent: '#ffffff',
+            btnPrimaryBg: '#ffffff',
+            btnPrimaryText: '#000000',
+            btnPrimaryHover: '#e0e0e0',
+            tooltipBg: '#1a1a1a',
+            tooltipText: '#ffffff',
+            keyBg: 'rgba(255,255,255,0.1)',
         },
         light: {
             background: '#ffffff',
-            text: '#1a1a1a', textSecondary: '#555555', textMuted: '#888888',
-            border: '#e0e0e0', accent: '#000000',
-            btnPrimaryBg: '#1a1a1a', btnPrimaryText: '#ffffff', btnPrimaryHover: '#333333',
-            tooltipBg: '#1a1a1a', tooltipText: '#ffffff',
-            keyBg: 'rgba(0,0,0,0.1)'
+            text: '#1a1a1a',
+            textSecondary: '#555555',
+            textMuted: '#888888',
+            border: '#e0e0e0',
+            accent: '#000000',
+            btnPrimaryBg: '#1a1a1a',
+            btnPrimaryText: '#ffffff',
+            btnPrimaryHover: '#333333',
+            tooltipBg: '#1a1a1a',
+            tooltipText: '#ffffff',
+            keyBg: 'rgba(0,0,0,0.1)',
         },
         midnight: {
             background: '#0d1117',
-            text: '#c9d1d9', textSecondary: '#8b949e', textMuted: '#6e7681',
-            border: '#30363d', accent: '#58a6ff',
-            btnPrimaryBg: '#58a6ff', btnPrimaryText: '#0d1117', btnPrimaryHover: '#79b8ff',
-            tooltipBg: '#161b22', tooltipText: '#c9d1d9',
-            keyBg: 'rgba(88,166,255,0.15)'
+            text: '#c9d1d9',
+            textSecondary: '#8b949e',
+            textMuted: '#6e7681',
+            border: '#30363d',
+            accent: '#58a6ff',
+            btnPrimaryBg: '#58a6ff',
+            btnPrimaryText: '#0d1117',
+            btnPrimaryHover: '#79b8ff',
+            tooltipBg: '#161b22',
+            tooltipText: '#c9d1d9',
+            keyBg: 'rgba(88,166,255,0.15)',
         },
         sepia: {
             background: '#f4ecd8',
-            text: '#5c4b37', textSecondary: '#7a6a56', textMuted: '#998875',
-            border: '#d4c8b0', accent: '#8b4513',
-            btnPrimaryBg: '#5c4b37', btnPrimaryText: '#f4ecd8', btnPrimaryHover: '#7a6a56',
-            tooltipBg: '#5c4b37', tooltipText: '#f4ecd8',
-            keyBg: 'rgba(92,75,55,0.15)'
+            text: '#5c4b37',
+            textSecondary: '#7a6a56',
+            textMuted: '#998875',
+            border: '#d4c8b0',
+            accent: '#8b4513',
+            btnPrimaryBg: '#5c4b37',
+            btnPrimaryText: '#f4ecd8',
+            btnPrimaryHover: '#7a6a56',
+            tooltipBg: '#5c4b37',
+            tooltipText: '#f4ecd8',
+            keyBg: 'rgba(92,75,55,0.15)',
         },
         catppuccin: {
             background: '#1e1e2e',
-            text: '#cdd6f4', textSecondary: '#a6adc8', textMuted: '#585b70',
-            border: '#313244', accent: '#cba6f7',
-            btnPrimaryBg: '#cba6f7', btnPrimaryText: '#1e1e2e', btnPrimaryHover: '#b4befe',
-            tooltipBg: '#313244', tooltipText: '#cdd6f4',
-            keyBg: 'rgba(203,166,247,0.12)'
+            text: '#cdd6f4',
+            textSecondary: '#a6adc8',
+            textMuted: '#585b70',
+            border: '#313244',
+            accent: '#cba6f7',
+            btnPrimaryBg: '#cba6f7',
+            btnPrimaryText: '#1e1e2e',
+            btnPrimaryHover: '#b4befe',
+            tooltipBg: '#313244',
+            tooltipText: '#cdd6f4',
+            keyBg: 'rgba(203,166,247,0.12)',
         },
         gruvbox: {
             background: '#1d2021',
-            text: '#ebdbb2', textSecondary: '#a89984', textMuted: '#665c54',
-            border: '#3c3836', accent: '#fe8019',
-            btnPrimaryBg: '#fe8019', btnPrimaryText: '#1d2021', btnPrimaryHover: '#fabd2f',
-            tooltipBg: '#3c3836', tooltipText: '#ebdbb2',
-            keyBg: 'rgba(254,128,25,0.12)'
+            text: '#ebdbb2',
+            textSecondary: '#a89984',
+            textMuted: '#665c54',
+            border: '#3c3836',
+            accent: '#fe8019',
+            btnPrimaryBg: '#fe8019',
+            btnPrimaryText: '#1d2021',
+            btnPrimaryHover: '#fabd2f',
+            tooltipBg: '#3c3836',
+            tooltipText: '#ebdbb2',
+            keyBg: 'rgba(254,128,25,0.12)',
         },
         rosepine: {
             background: '#191724',
-            text: '#e0def4', textSecondary: '#908caa', textMuted: '#6e6a86',
-            border: '#26233a', accent: '#ebbcba',
-            btnPrimaryBg: '#ebbcba', btnPrimaryText: '#191724', btnPrimaryHover: '#f6c177',
-            tooltipBg: '#26233a', tooltipText: '#e0def4',
-            keyBg: 'rgba(235,188,186,0.12)'
+            text: '#e0def4',
+            textSecondary: '#908caa',
+            textMuted: '#6e6a86',
+            border: '#26233a',
+            accent: '#ebbcba',
+            btnPrimaryBg: '#ebbcba',
+            btnPrimaryText: '#191724',
+            btnPrimaryHover: '#f6c177',
+            tooltipBg: '#26233a',
+            tooltipText: '#e0def4',
+            keyBg: 'rgba(235,188,186,0.12)',
         },
         solarized: {
             background: '#002b36',
-            text: '#93a1a1', textSecondary: '#839496', textMuted: '#586e75',
-            border: '#073642', accent: '#2aa198',
-            btnPrimaryBg: '#2aa198', btnPrimaryText: '#002b36', btnPrimaryHover: '#268bd2',
-            tooltipBg: '#073642', tooltipText: '#93a1a1',
-            keyBg: 'rgba(42,161,152,0.12)'
+            text: '#93a1a1',
+            textSecondary: '#839496',
+            textMuted: '#586e75',
+            border: '#073642',
+            accent: '#2aa198',
+            btnPrimaryBg: '#2aa198',
+            btnPrimaryText: '#002b36',
+            btnPrimaryHover: '#268bd2',
+            tooltipBg: '#073642',
+            tooltipText: '#93a1a1',
+            keyBg: 'rgba(42,161,152,0.12)',
         },
         tokyonight: {
             background: '#1a1b26',
-            text: '#c0caf5', textSecondary: '#9aa5ce', textMuted: '#565f89',
-            border: '#292e42', accent: '#7aa2f7',
-            btnPrimaryBg: '#7aa2f7', btnPrimaryText: '#1a1b26', btnPrimaryHover: '#bb9af7',
-            tooltipBg: '#292e42', tooltipText: '#c0caf5',
-            keyBg: 'rgba(122,162,247,0.12)'
+            text: '#c0caf5',
+            textSecondary: '#9aa5ce',
+            textMuted: '#565f89',
+            border: '#292e42',
+            accent: '#7aa2f7',
+            btnPrimaryBg: '#7aa2f7',
+            btnPrimaryText: '#1a1b26',
+            btnPrimaryHover: '#bb9af7',
+            tooltipBg: '#292e42',
+            tooltipText: '#c0caf5',
+            keyBg: 'rgba(122,162,247,0.12)',
         },
     },
 
@@ -883,29 +902,31 @@ const theme = {
             gruvbox: 'Gruvbox Dark',
             rosepine: 'Ros\u00e9 Pine',
             solarized: 'Solarized Dark',
-            tokyonight: 'Tokyo Night'
+            tokyonight: 'Tokyo Night',
         };
         return Object.keys(this.themes).map(key => ({
             value: key,
             name: names[key] || key,
-            colors: this.themes[key]
+            colors: this.themes[key],
         }));
     },
 
     hexToRgb(hex) {
         const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-        return result ? {
-            r: parseInt(result[1], 16),
-            g: parseInt(result[2], 16),
-            b: parseInt(result[3], 16)
-        } : { r: 30, g: 30, b: 30 };
+        return result
+            ? {
+                  r: parseInt(result[1], 16),
+                  g: parseInt(result[2], 16),
+                  b: parseInt(result[3], 16),
+              }
+            : { r: 30, g: 30, b: 30 };
     },
 
     lightenColor(rgb, amount) {
         return {
             r: Math.min(255, rgb.r + amount),
             g: Math.min(255, rgb.g + amount),
-            b: Math.min(255, rgb.b + amount)
+            b: Math.min(255, rgb.b + amount),
         };
     },
 
@@ -913,7 +934,7 @@ const theme = {
         return {
             r: Math.max(0, rgb.r - amount),
             g: Math.max(0, rgb.g - amount),
-            b: Math.max(0, rgb.b - amount)
+            b: Math.max(0, rgb.b - amount),
         };
     },
 
@@ -1009,7 +1030,7 @@ const theme = {
     async save(themeName) {
         await storage.updatePreference('theme', themeName);
         this.apply(themeName);
-    }
+    },
 };
 
 // Consolidated cheatingDaddy object - all functions in one place

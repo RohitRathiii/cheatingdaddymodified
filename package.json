@@ -24,7 +24,7 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
-        "@google/genai": "^1.2.0",
+        "@google/genai": "^2.19.0",
         "@huggingface/transformers": "^3.8.1",
         "electron-squirrel-startup": "^1.0.1",
         "ollama": "^0.6.3",
