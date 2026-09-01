@@ -5,6 +5,8 @@ const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
 const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getModelForToday } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
+const { captureScreenStill } = require('./screenStill');
+const { chooseAnalyzeScreenPath, sendForcedLiveScreenTurn } = require('./analyzeScreenSend');
 
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
@@ -145,6 +147,8 @@ let sessionResumptionHandle = null;
 let reconnectInFlight = false;
 let pendingLiveImage = null;
 let liveImageSendInFlight = false;
+let lastScreenshotJpeg = null;
+let pendingTypedQuestion = null;
 
 // 3.1 batches inputTranscription after the utterance, so this timer starts
 // once the full text arrives — not mid-sentence like 2.5 incremental chunks.
@@ -200,6 +204,8 @@ function initializeNewSession(profile = null, customPrompt = null) {
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
+    lastScreenshotJpeg = null;
+    pendingTypedQuestion = null;
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
@@ -219,9 +225,12 @@ function saveConversationTurn(transcription, aiResponse) {
         initializeNewSession();
     }
 
+    const userSide = (pendingTypedQuestion || transcription || '').trim();
+    pendingTypedQuestion = null;
+
     const conversationTurn = {
         timestamp: Date.now(),
-        transcription: transcription.trim(),
+        transcription: userSide,
         ai_response: aiResponse.trim(),
     };
 
@@ -266,6 +275,59 @@ function getCurrentSessionData() {
         sessionId: currentSessionId,
         history: conversationHistory,
     };
+}
+
+function buildSessionContextText() {
+    const parts = [];
+    if (conversationHistory.length > 0) {
+        parts.push('Full conversation so far (use every turn, not only the last one):');
+        conversationHistory.forEach((turn, index) => {
+            const n = index + 1;
+            if (turn.transcription?.trim()) {
+                parts.push(`[Turn ${n} user/interviewer]: ${turn.transcription.trim()}`);
+            }
+            if (turn.ai_response?.trim()) {
+                parts.push(`[Turn ${n} assistant]: ${turn.ai_response.trim()}`);
+            }
+        });
+    }
+    if (screenAnalysisHistory.length > 0) {
+        parts.push('Earlier screen analyses in this session:');
+        screenAnalysisHistory.forEach((entry, index) => {
+            if (entry.response?.trim()) {
+                parts.push(`[Screen ${index + 1}]: ${entry.response.trim().slice(0, 2500)}`);
+            }
+        });
+    }
+    return parts.join('\n');
+}
+
+function composeUserTurn(text) {
+    const context = buildSessionContextText();
+    if (!context) {
+        return text;
+    }
+    return `${context}\n\nCurrent user question (answer using the full conversation and any screen context above):\n${text}`;
+}
+
+function rememberScreenshot(base64Data) {
+    if (base64Data && typeof base64Data === 'string' && base64Data.length > 100) {
+        lastScreenshotJpeg = base64Data;
+    }
+}
+
+async function attachLastScreenshotToLive(session) {
+    if (!session || !lastScreenshotJpeg) return;
+    try {
+        session.sendRealtimeInput({
+            video: {
+                data: lastScreenshotJpeg,
+                mimeType: 'image/jpeg',
+            },
+        });
+    } catch (error) {
+        console.warn('Failed to attach last screenshot to Live session:', error.message);
+    }
 }
 
 async function getEnabledTools() {
@@ -706,8 +768,9 @@ function sendImageToGeminiLive(session, data, prompt) {
         return { success: false, error: 'No active Gemini Live session' };
     }
     pendingLiveImage = { data, prompt: prompt || '' };
-    if (!geminiSendLock) {
-        flushPendingLiveImage(session);
+    const result = flushPendingLiveImage(session);
+    if (result && result.success === false) {
+        return result;
     }
     return { success: true, model: GEMINI_LIVE_MODEL };
 }
@@ -718,14 +781,10 @@ function flushPendingLiveImage(session) {
     const { data, prompt } = pendingLiveImage;
     pendingLiveImage = null;
     try {
-        session.sendRealtimeInput({
-            video: { data, mimeType: 'image/jpeg' },
-        });
-        if (prompt.trim()) {
-            session.sendRealtimeInput({ text: prompt.trim() });
-        }
+        return sendForcedLiveScreenTurn(session, data, prompt);
     } catch (error) {
         console.error('Failed to send screenshot to Gemini Live:', error);
+        return { success: false, error: error.message };
     } finally {
         liveImageSendInFlight = false;
         if (pendingLiveImage) {
@@ -1365,6 +1424,10 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
         console.log(`Image response completed from ${model}`);
 
+        if (!fullText.trim()) {
+            return { success: false, error: 'Screen analysis returned no text' };
+        }
+
         // Inject screen analysis into Groq context for follow-up voice questions
         if (fullText.trim()) {
             groqConversationHistory.push({
@@ -1497,6 +1560,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         return { success: false, error: 'No active Gemini session' };
     });
 
+    ipcMain.handle('capture-screen-still', async (event, payload = {}) => {
+        const quality = payload && typeof payload.quality === 'string' ? payload.quality : 'medium';
+        const allowed = quality === 'high' || quality === 'medium' || quality === 'low' ? quality : 'medium';
+        return captureScreenStill({ quality: allowed });
+    });
+
     ipcMain.handle('send-image-content', async (event, { data, prompt }) => {
         try {
             if (!data || typeof data !== 'string') {
@@ -1511,33 +1580,57 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return { success: false, error: 'Image buffer too small' };
             }
 
-            if (currentProviderMode === 'cloud') {
-                const sent = sendCloudImage(data);
-                if (!sent) {
+            rememberScreenshot(data);
+            pendingTypedQuestion = 'Analyze Screen';
+            const analyzePrompt = composeUserTurn(prompt || 'Analyze this screenshot now. Give the complete answer from what you see.');
+            sendToRenderer('update-status', 'Analyzing screen...');
+
+            const analyzePath = chooseAnalyzeScreenPath({
+                providerMode: currentProviderMode,
+                hasApiKey: Boolean(getApiKey()),
+                hasLiveSession: Boolean(geminiSessionRef.current),
+                hasGroq: canUseGroqFallback(),
+            });
+
+            if (analyzePath === 'cloud') {
+                const sentImage = sendCloudImage(data);
+                const sentText = sendCloudText(analyzePrompt);
+                if (!sentImage || !sentText) {
                     return { success: false, error: 'Cloud connection not active' };
                 }
                 return { success: true, model: 'cloud' };
             }
 
-            if (currentProviderMode === 'local') {
-                const result = await getLocalAi().sendLocalImage(data, prompt);
-                return result;
+            if (analyzePath === 'local') {
+                return await getLocalAi().sendLocalImage(data, analyzePrompt);
             }
 
-            if (geminiSessionRef.current) {
-                return sendImageToGeminiLive(geminiSessionRef.current, data, prompt);
+            if (analyzePath === 'http') {
+                const result = await sendImageToGeminiHttp(data, analyzePrompt);
+                if (result.success && result.text?.trim()) {
+                    if (geminiSessionRef.current) {
+                        await attachLastScreenshotToLive(geminiSessionRef.current);
+                    }
+                    return result;
+                }
+                if (geminiSessionRef.current) {
+                    const liveResult = sendImageToGeminiLive(geminiSessionRef.current, data, analyzePrompt);
+                    if (liveResult.success) {
+                        return liveResult;
+                    }
+                }
+                return result.success === false ? result : { success: false, error: 'Screen analysis returned no text' };
             }
 
-            if (sessionParams) {
-                return { success: false, error: 'No active Gemini Live session' };
+            if (analyzePath === 'live') {
+                return sendImageToGeminiLive(geminiSessionRef.current, data, analyzePrompt);
             }
 
-            if (canUseGroqFallback()) {
-                const result = await sendImageToGroqLlama4(data, prompt);
-                return result;
+            if (analyzePath === 'groq') {
+                return await sendImageToGroqLlama4(data, analyzePrompt);
             }
 
-            return { success: false, error: 'No active Gemini Live session' };
+            return { success: false, error: 'No active Gemini session' };
         } catch (error) {
             console.error('Error sending image:', error);
             return { success: false, error: error.message };
@@ -1549,10 +1642,20 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success: false, error: 'Invalid text message' };
         }
 
+        const userText = text.trim();
+        pendingTypedQuestion = userText;
+        const contextualText = composeUserTurn(userText);
+
         if (currentProviderMode === 'cloud') {
             try {
-                console.log('Sending text to cloud:', text);
-                sendCloudText(text.trim());
+                console.log('Sending text to cloud with full session context');
+                if (lastScreenshotJpeg) {
+                    sendCloudImage(lastScreenshotJpeg);
+                }
+                const sent = sendCloudText(contextualText);
+                if (!sent) {
+                    return { success: false, error: 'Cloud connection not active' };
+                }
                 return { success: true };
             } catch (error) {
                 console.error('Error sending cloud text:', error);
@@ -1562,8 +1665,11 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
         if (currentProviderMode === 'local') {
             try {
-                console.log('Sending text to local Ollama:', text);
-                return await getLocalAi().sendLocalText(text.trim());
+                console.log('Sending text to local Ollama with session context');
+                if (lastScreenshotJpeg) {
+                    return await getLocalAi().sendLocalImage(lastScreenshotJpeg, contextualText);
+                }
+                return await getLocalAi().sendLocalText(contextualText);
             } catch (error) {
                 console.error('Error sending local text:', error);
                 return { success: false, error: error.message };
@@ -1571,15 +1677,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
 
         if (!geminiSessionRef.current && canUseGroqFallback()) {
-            sendToGroq(text.trim());
+            sendToGroq(contextualText);
             return { success: true };
         }
 
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
 
         try {
-            console.log('Sending text to Gemini Live:', text);
-            await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
+            console.log('Sending text to Gemini Live with full session context');
+            await attachLastScreenshotToLive(geminiSessionRef.current);
+            await geminiSessionRef.current.sendRealtimeInput({ text: contextualText });
             return { success: true };
         } catch (error) {
             console.error('Error sending text:', error);

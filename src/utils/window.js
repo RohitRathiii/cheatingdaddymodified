@@ -1,8 +1,56 @@
 const { BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
 const path = require('node:path');
 const storage = require('../storage');
+const { startOptionTapMonitor, stopOptionTapMonitor } = require('./optionTapMonitor');
 
 let mouseEventsIgnored = false;
+let stealthHidden = false;
+let lastVisibilityToggleAt = 0;
+
+function isOverlayShown(mainWindow) {
+    return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !stealthHidden);
+}
+
+function setClickThrough(mainWindow, enabled) {
+    mouseEventsIgnored = enabled;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (enabled) {
+        mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    } else {
+        mainWindow.setIgnoreMouseEvents(false);
+    }
+    mainWindow.webContents.send('click-through-toggled', enabled);
+}
+
+function hideOverlayWindow(mainWindow) {
+    if (!mainWindow || mainWindow.isDestroyed() || stealthHidden) return;
+    stealthHidden = true;
+    setClickThrough(mainWindow, true);
+    mainWindow.webContents.send('stealth-hidden-changed', true);
+    mainWindow.hide();
+}
+
+function showOverlayWindow(mainWindow) {
+    stealthHidden = false;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    setClickThrough(mainWindow, false);
+    if (!mainWindow.isVisible()) {
+        mainWindow.showInactive();
+    }
+    mainWindow.webContents.send('stealth-hidden-changed', false);
+}
+
+function toggleOverlayVisibility(mainWindow) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const now = Date.now();
+    if (now - lastVisibilityToggleAt < 250) return;
+    lastVisibilityToggleAt = now;
+    if (isOverlayShown(mainWindow)) {
+        hideOverlayWindow(mainWindow);
+    } else {
+        showOverlayWindow(mainWindow);
+    }
+}
 
 function createWindow(sendToRenderer, geminiSessionRef) {
     // Get layout preference (default to 'normal')
@@ -90,6 +138,13 @@ function createWindow(sendToRenderer, geminiSessionRef) {
 
     setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef);
 
+    const optionMonitorReady = startOptionTapMonitor(() => {
+        toggleOverlayVisibility(mainWindow);
+    });
+    if (!optionMonitorReady) {
+        console.warn('Option tap hide requires Accessibility on macOS; Cmd+\\ still toggles visibility.');
+    }
+
     return mainWindow;
 }
 
@@ -162,11 +217,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     if (keybinds.toggleVisibility) {
         try {
             globalShortcut.register(keybinds.toggleVisibility, () => {
-                if (mainWindow.isVisible()) {
-                    mainWindow.hide();
-                } else {
-                    mainWindow.showInactive();
-                }
+                toggleOverlayVisibility(mainWindow);
             });
             console.log(`Registered toggleVisibility: ${keybinds.toggleVisibility}`);
         } catch (error) {
@@ -178,15 +229,8 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
     if (keybinds.toggleClickThrough) {
         try {
             globalShortcut.register(keybinds.toggleClickThrough, () => {
-                mouseEventsIgnored = !mouseEventsIgnored;
-                if (mouseEventsIgnored) {
-                    mainWindow.setIgnoreMouseEvents(true, { forward: true });
-                    console.log('Mouse events ignored');
-                } else {
-                    mainWindow.setIgnoreMouseEvents(false);
-                    console.log('Mouse events enabled');
-                }
-                mainWindow.webContents.send('click-through-toggled', mouseEventsIgnored);
+                setClickThrough(mainWindow, !mouseEventsIgnored);
+                console.log(mouseEventsIgnored ? 'Mouse events ignored' : 'Mouse events enabled');
             });
             console.log(`Registered toggleClickThrough: ${keybinds.toggleClickThrough}`);
         } catch (error) {
@@ -276,6 +320,7 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             globalShortcut.register(keybinds.emergencyErase, () => {
                 console.log('Emergency Erase triggered!');
                 if (mainWindow && !mainWindow.isDestroyed()) {
+                    stopOptionTapMonitor();
                     mainWindow.hide();
 
                     if (geminiSessionRef.current) {
@@ -341,11 +386,7 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
                 return { success: false, error: 'Window has been destroyed' };
             }
 
-            if (mainWindow.isVisible()) {
-                mainWindow.hide();
-            } else {
-                mainWindow.showInactive();
-            }
+            toggleOverlayVisibility(mainWindow);
             return { success: true };
         } catch (error) {
             console.error('Error toggling window visibility:', error);
@@ -365,4 +406,7 @@ module.exports = {
     getDefaultKeybinds,
     updateGlobalShortcuts,
     setupWindowIpcHandlers,
+    toggleOverlayVisibility,
+    hideOverlayWindow,
+    showOverlayWindow,
 };

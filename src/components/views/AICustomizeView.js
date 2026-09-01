@@ -71,6 +71,7 @@ export class AICustomizeView extends LitElement {
     _getProfileName(profile) {
         const names = {
             interview: 'Job Interview',
+            lld: 'LLD Interview (SDE-2)',
             sales: 'Sales Call',
             meeting: 'Business Meeting',
             presentation: 'Presentation',
@@ -83,6 +84,7 @@ export class AICustomizeView extends LitElement {
     render() {
         const profiles = [
             { value: 'interview', label: 'Job Interview' },
+            { value: 'lld', label: 'LLD Interview (SDE-2)' },
             { value: 'sales', label: 'Sales Call' },
             { value: 'meeting', label: 'Business Meeting' },
             { value: 'presentation', label: 'Presentation' },
@@ -109,15 +111,24 @@ export class AICustomizeView extends LitElement {
                                 <label class="form-label">Custom Instructions</label>
                                 <textarea
                                     class="control"
-                                    placeholder="Resume details, role requirements, constraints..."
+                                    placeholder=${
+                                        this.selectedProfile === 'lld'
+                                            ? 'Optional: Java or Python, Amazon/Flipkart, any use cases they already sent...'
+                                            : 'Resume details, role requirements, constraints...'
+                                    }
                                     .value=${this._context}
                                     @input=${e => this._saveContext(e.target.value)}
                                 ></textarea>
-                                <div class="form-help">Sent as context at session start. Keep it short.</div>
+                                <div class="form-help">
+                                    ${
+                                        this.selectedProfile === 'lld'
+                                            ? 'LLD coach is already in the profile. Put only language, company, or a pasted spec here.'
+                                            : 'Sent as context at session start. Keep it short.'
+                                    }
+                                </div>
                             </div>
                         </div>
                     </section>
-
                 </div>
             </div>
         `;

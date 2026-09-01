@@ -207,26 +207,19 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
     try {
         if (isMacOS) {
-            // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
+            // Audio is optional. Screenshots use main-process desktopCapturer, not getDisplayMedia.
             console.log('Starting macOS capture with SystemAudioDump...');
 
-            // Start macOS audio capture
-            const audioResult = await ipcRenderer.invoke('start-macos-audio');
-            if (!audioResult.success) {
-                throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+            try {
+                const audioResult = await ipcRenderer.invoke('start-macos-audio');
+                if (!audioResult?.success) {
+                    console.warn('macOS audio capture failed, continuing without system audio:', audioResult?.error);
+                }
+            } catch (audioError) {
+                console.warn('macOS audio capture failed, continuing without system audio:', audioError);
             }
 
-            // Get screen capture for screenshots
-            mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: 1,
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 },
-                },
-                audio: false, // Don't use browser audio on macOS
-            });
-
-            console.log('macOS screen capture started - audio handled by SystemAudioDump');
+            console.log('macOS capture started — Analyze Screen uses desktopCapturer');
 
             if (audioMode === 'mic_only' || audioMode === 'both') {
                 let micStream = null;
@@ -353,11 +346,13 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             }
         }
 
-        console.log('MediaStream obtained:', {
-            hasVideo: mediaStream.getVideoTracks().length > 0,
-            hasAudio: mediaStream.getAudioTracks().length > 0,
-            videoTrack: mediaStream.getVideoTracks()[0]?.getSettings(),
-        });
+        if (mediaStream) {
+            console.log('MediaStream obtained:', {
+                hasVideo: mediaStream.getVideoTracks().length > 0,
+                hasAudio: mediaStream.getAudioTracks().length > 0,
+                videoTrack: mediaStream.getVideoTracks()[0]?.getSettings(),
+            });
+        }
 
         // Manual mode only - screenshots captured on demand via shortcut
         console.log('Manual mode enabled - screenshots will be captured on demand only');
@@ -571,19 +566,26 @@ async function flushPendingScreenshot() {
     }
 
     screenshotSendInFlight = true;
-    const { prompt, quality } = pendingScreenshotJob;
+    const { prompt, quality, resolve } = pendingScreenshotJob;
     pendingScreenshotJob = null;
 
     try {
-        const ready = await ensureScreenshotVideo();
-        if (!ready) return;
-        const encoded = await encodeScreenshotJpeg(quality);
+        const captured = await ipcRenderer.invoke('capture-screen-still', { quality });
+        if (!captured?.success) {
+            const error = captured?.error || 'Failed to capture the screen.';
+            console.error(error);
+            if (typeof cheatingDaddy !== 'undefined' && cheatingDaddy.addNewResponse) {
+                cheatingDaddy.addNewResponse(`Analyze Screen failed: ${error}`);
+            }
+            resolve?.({ success: false, error });
+            return;
+        }
         lastScreenshotSentAt = Date.now();
-        console.log(`Sending screenshot: ${encoded.width}x${encoded.height}, ~${Math.round(encoded.data.length / 1024)}KB`);
+        console.log(`Sending screenshot: ${captured.width}x${captured.height}, ~${Math.round(captured.data.length / 1024)}KB`);
         const result = await ipcRenderer.invoke('send-image-content', {
-            data: encoded.data,
+            data: captured.data,
             prompt,
-            mimeType: 'image/jpeg',
+            mimeType: captured.mimeType || 'image/jpeg',
         });
         if (!result.success) {
             console.error('Failed to send screenshot:', result.error);
@@ -591,8 +593,13 @@ async function flushPendingScreenshot() {
                 cheatingDaddy.addNewResponse(`Error: ${result.error}`);
             }
         }
+        resolve?.(result);
     } catch (error) {
         console.error('Screenshot capture failed:', error);
+        if (typeof cheatingDaddy !== 'undefined' && cheatingDaddy.addNewResponse) {
+            cheatingDaddy.addNewResponse(`Analyze Screen failed: ${error.message}`);
+        }
+        resolve?.({ success: false, error: error.message });
     } finally {
         screenshotSendInFlight = false;
         if (pendingScreenshotJob) {
@@ -602,13 +609,18 @@ async function flushPendingScreenshot() {
 }
 
 function queueScreenshot({ prompt = MANUAL_SCREENSHOT_PROMPT, quality = currentImageQuality } = {}) {
-    pendingScreenshotJob = { prompt, quality };
-    flushPendingScreenshot();
+    return new Promise(resolve => {
+        if (pendingScreenshotJob?.resolve) {
+            pendingScreenshotJob.resolve({ success: false, error: 'Replaced by a newer screenshot' });
+        }
+        pendingScreenshotJob = { prompt, quality, resolve };
+        flushPendingScreenshot();
+    });
 }
 
 async function captureScreenshot(imageQuality = 'medium', isManual = false) {
     console.log(`Capturing ${isManual ? 'manual' : 'automated'} screenshot...`);
-    queueScreenshot({
+    return queueScreenshot({
         prompt: MANUAL_SCREENSHOT_PROMPT,
         quality: imageQuality,
     });
@@ -617,7 +629,7 @@ async function captureScreenshot(imageQuality = 'medium', isManual = false) {
 async function captureManualScreenshot(imageQuality = null, extraContext = '') {
     console.log('Manual screenshot triggered');
     const prompt = extraContext ? `${MANUAL_SCREENSHOT_PROMPT}\n\nSpoken request: ${extraContext}` : MANUAL_SCREENSHOT_PROMPT;
-    queueScreenshot({
+    return queueScreenshot({
         prompt,
         quality: imageQuality || currentImageQuality,
     });

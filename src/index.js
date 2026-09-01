@@ -3,6 +3,16 @@ if (require('electron-squirrel-startup')) {
 }
 
 const { app, BrowserWindow, shell, ipcMain } = require('electron');
+
+// Electron 29.1+ ScreenCaptureKit thumbnails are empty on macOS. Disable that path
+// so Analyze Screen can get a real JPEG. https://github.com/electron/electron/issues/44504
+if (process.platform === 'darwin') {
+    app.commandLine.appendSwitch(
+        'disable-features',
+        ['ThumbnailCapturerMac:capture_mode/sc_screenshot_manager', 'ScreenCaptureKitPickerScreen', 'ScreenCaptureKitStreamPickerSonoma'].join(',')
+    );
+}
+
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
@@ -40,6 +50,11 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
     stopMacOSAudioCapture();
+    try {
+        require('./utils/optionTapMonitor').stopOptionTapMonitor();
+    } catch (error) {
+        // ignore
+    }
 });
 
 app.on('activate', () => {
