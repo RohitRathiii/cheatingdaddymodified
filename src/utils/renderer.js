@@ -21,7 +21,9 @@ let currentImageQuality = 'medium'; // Store current image quality for manual sc
 const isLinux = process.platform === 'linux';
 const isMacOS = process.platform === 'darwin';
 const isWindows = process.platform === 'win32';
-const { resolveBackgroundAlpha } = require('./overlayVisibility');
+// This file is loaded by index.html via <script src>, so relative CommonJS
+// imports resolve from src/index.html rather than from src/utils/renderer.js.
+const { resolveBackgroundAlpha } = require('./utils/overlayVisibility');
 
 if (isWindows && document.documentElement) {
     document.documentElement.classList.add('windows-opaque');

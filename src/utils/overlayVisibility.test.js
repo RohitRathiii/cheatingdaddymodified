@@ -1,5 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
     isAltKeyEvent,
     isAltUsedAsChord,
@@ -87,4 +89,10 @@ test('uses an opaque, immediately visible window on Windows', () => {
     assert.equal(shouldShowWindowOnCreate('darwin'), false);
     assert.equal(resolveBackgroundAlpha('win32', 0.8), 1);
     assert.equal(resolveBackgroundAlpha('darwin', 0.8), 0.8);
+});
+
+test('renderer resolves the visibility helper relative to index.html', () => {
+    const rendererSource = fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
+    assert.match(rendererSource, /require\(['"]\.\/utils\/overlayVisibility['"]\)/);
+    assert.doesNotThrow(() => require(path.join(__dirname, 'overlayVisibility.js')));
 });
