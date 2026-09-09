@@ -328,6 +328,7 @@ export class AssistantView extends LitElement {
 
     static properties = {
         responses: { type: Array },
+        responseNumberOffset: { type: Number },
         currentResponseIndex: { type: Number },
         selectedProfile: { type: String },
         onSendText: { type: Function },
@@ -339,6 +340,7 @@ export class AssistantView extends LitElement {
     constructor() {
         super();
         this.responses = [];
+        this.responseNumberOffset = 0;
         this.currentResponseIndex = -1;
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
@@ -348,6 +350,10 @@ export class AssistantView extends LitElement {
         this._cardCount = 0;
         this._latestObserver = null;
         this._analyzeTimeout = null;
+        this._renderedContent = new WeakMap();
+        this._markdownCache = new Map();
+        this._visibleStart = -1;
+        this._visibleEnd = -1;
     }
 
     getProfileNames() {
@@ -375,8 +381,10 @@ export class AssistantView extends LitElement {
                     gfm: true,
                     sanitize: false,
                 });
-                let rendered = window.marked.parse(content);
-                rendered = this.wrapWordsInSpans(rendered);
+                if (this._markdownCache.has(content)) return this._markdownCache.get(content);
+                const rendered = window.marked.parse(content);
+                this._markdownCache.set(content, rendered);
+                if (this._markdownCache.size > 100) this._markdownCache.delete(this._markdownCache.keys().next().value);
                 return rendered;
             } catch (error) {
                 console.warn('Error parsing markdown:', error);
@@ -473,6 +481,11 @@ export class AssistantView extends LitElement {
 
     connectedCallback() {
         super.connectedCallback();
+        this._visibilityHandler = () => {
+            if (document.hidden) this._stopWaveformAnimation();
+            else if (this.isAnalyzing) this._startWaveformAnimation();
+        };
+        document.addEventListener('visibilitychange', this._visibilityHandler);
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
@@ -493,6 +506,7 @@ export class AssistantView extends LitElement {
         super.disconnectedCallback();
         this._stopWaveformAnimation();
         this._disconnectLatestObserver();
+        if (this._visibilityHandler) document.removeEventListener('visibilitychange', this._visibilityHandler);
         if (this._analyzeTimeout) {
             clearTimeout(this._analyzeTimeout);
             this._analyzeTimeout = null;
@@ -512,7 +526,11 @@ export class AssistantView extends LitElement {
         if (textInput && textInput.value.trim()) {
             const message = textInput.value.trim();
             textInput.value = '';
-            await this.onSendText(message);
+            const result = await this.onSendText(message);
+            if (result?.queueFull) {
+                textInput.value = message;
+                textInput.focus();
+            }
         }
     }
 
@@ -696,7 +714,7 @@ export class AssistantView extends LitElement {
         if (changedProperties.has('responses')) {
             this._syncTranscript();
         } else if (changedProperties.has('currentResponseIndex')) {
-            this._updateFocusedCard();
+            this._syncTranscript();
         }
 
         if (changedProperties.has('selectedProfile') && this.responses.length === 0) {
@@ -733,7 +751,7 @@ export class AssistantView extends LitElement {
 
         const label = document.createElement('div');
         label.className = 'answer-label';
-        label.textContent = `Answer ${index + 1}`;
+        label.textContent = `Answer ${this.responseNumberOffset + index + 1}`;
 
         const body = document.createElement('div');
         body.className = 'answer-body';
@@ -746,9 +764,9 @@ export class AssistantView extends LitElement {
     _setCardBody(card, content) {
         const body = card.querySelector('.answer-body');
         if (!body) return;
-        if (card.dataset.content === content) return;
+        if (this._renderedContent.get(card) === content) return;
         body.innerHTML = this.renderMarkdown(content);
-        card.dataset.content = content;
+        this._renderedContent.set(card, content);
     }
 
     _updateFocusedCard() {
@@ -810,23 +828,28 @@ export class AssistantView extends LitElement {
             return;
         }
 
-        if (this._cardCount === 0 || container.querySelector('.placeholder')) {
+        const { visibleAnswerRange } = window.require('./utils/visibleAnswerRange');
+        const range = visibleAnswerRange(this.responses.length, this.currentResponseIndex, 30);
+        const rangeChanged = range.start !== this._visibleStart || range.end !== this._visibleEnd;
+        if (rangeChanged || container.querySelector('.placeholder')) {
             container.innerHTML = '';
             this._cardCount = 0;
+            this._visibleStart = range.start;
+            this._visibleEnd = range.end;
         }
 
         const previousCount = this._cardCount;
-        while (this._cardCount < this.responses.length) {
-            const card = this._createCard(this._cardCount);
+        while (this._visibleStart + this._cardCount < this._visibleEnd) {
+            const index = this._visibleStart + this._cardCount;
+            const card = this._createCard(index);
             container.appendChild(card);
-            this._setCardBody(card, this.responses[this._cardCount]);
+            this._setCardBody(card, this.responses[index]);
             this._cardCount++;
         }
 
-        const lastIndex = this.responses.length - 1;
-        const lastCard = container.querySelector(`[data-answer-index="${lastIndex}"]`);
-        if (lastCard) {
-            this._setCardBody(lastCard, this.responses[lastIndex]);
+        for (const card of container.querySelectorAll('.answer-card')) {
+            const index = Number(card.dataset.answerIndex);
+            this._setCardBody(card, this.responses[index]);
         }
 
         this._updateFocusedCard();

@@ -419,6 +419,12 @@ export class CheatingDaddyApp extends LitElement {
         this._updateAvailable = false;
         this._whisperDownloading = false;
         this._localVersion = '';
+        this._sessionController = null;
+        this._answerTurnIds = [];
+        this._answerSequences = {};
+        this._pendingAnswerEvents = new Map();
+        this._answerFlushTimer = null;
+        this.responseNumberOffset = 0;
 
         this._loadFromStorage();
         this._checkForUpdates();
@@ -472,8 +478,10 @@ export class CheatingDaddyApp extends LitElement {
 
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
-            ipcRenderer.on('new-response', (_, response) => this.addNewResponse(response));
-            ipcRenderer.on('update-response', (_, response) => this.updateCurrentResponse(response));
+            this._answerEventListener = (_, event) => this.handleAnswerEvent(event);
+            ipcRenderer.on('answer-event', this._answerEventListener);
+            this._stopMeetingListener = () => this.handleClose();
+            ipcRenderer.on('stop-meeting-requested', this._stopMeetingListener);
             ipcRenderer.on('update-status', (_, status) => this.setStatus(status));
             ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
                 this._isClickThrough = isEnabled;
@@ -533,14 +541,15 @@ export class CheatingDaddyApp extends LitElement {
         }
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
-            ipcRenderer.removeAllListeners('new-response');
-            ipcRenderer.removeAllListeners('update-response');
+            if (this._answerEventListener) ipcRenderer.removeListener('answer-event', this._answerEventListener);
+            if (this._stopMeetingListener) ipcRenderer.removeListener('stop-meeting-requested', this._stopMeetingListener);
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
             ipcRenderer.removeAllListeners('reconnect-failed');
             ipcRenderer.removeAllListeners('whisper-downloading');
             ipcRenderer.removeAllListeners('stealth-hidden-changed');
         }
+        if (this._answerFlushTimer) clearTimeout(this._answerFlushTimer);
     }
 
     // ── Timer ──
@@ -598,6 +607,55 @@ export class CheatingDaddyApp extends LitElement {
         this.requestUpdate();
     }
 
+    _applyAnswerEvent(event) {
+        if (!event?.turnId) return;
+        const { applyAnswerEvent } = window.require('./utils/answerEvents');
+        const oldLength = this.responses.length;
+        const wasOnLatest = this.currentResponseIndex < 0 || this.currentResponseIndex === oldLength - 1;
+        const next = applyAnswerEvent(
+            { responses: this.responses, turnIds: this._answerTurnIds, sequences: this._answerSequences },
+            event
+        );
+        this.responses = next.responses;
+        this._answerTurnIds = next.turnIds;
+        this._answerSequences = next.sequences;
+        if (this.responses.length > 100) {
+            const removed = this.responses.length - 100;
+            const removedTurnIds = this._answerTurnIds.slice(0, removed);
+            this.responses = this.responses.slice(removed);
+            this._answerTurnIds = this._answerTurnIds.slice(removed);
+            for (const turnId of removedTurnIds) delete this._answerSequences[turnId];
+            this.responseNumberOffset += removed;
+            if (!wasOnLatest) this.currentResponseIndex = Math.max(0, this.currentResponseIndex - removed);
+        }
+        if (wasOnLatest || this.responses.length > oldLength) {
+            this.currentResponseIndex = this.responses.length - 1;
+        }
+        this._awaitingNewResponse = false;
+        this.requestUpdate();
+    }
+
+    handleAnswerEvent(event) {
+        if (event.event === 'start') {
+            this._applyAnswerEvent(event);
+            return;
+        }
+        this._pendingAnswerEvents.set(event.turnId, event);
+        if (event.event === 'complete' || event.event === 'interrupted') {
+            this._flushAnswerEvents();
+            return;
+        }
+        if (!this._answerFlushTimer) this._answerFlushTimer = setTimeout(() => this._flushAnswerEvents(), 40);
+    }
+
+    _flushAnswerEvents() {
+        if (this._answerFlushTimer) clearTimeout(this._answerFlushTimer);
+        this._answerFlushTimer = null;
+        const events = [...this._pendingAnswerEvents.values()];
+        this._pendingAnswerEvents.clear();
+        for (const event of events) this._applyAnswerEvent(event);
+    }
+
     // ── Navigation ──
 
     navigate(view) {
@@ -607,11 +665,8 @@ export class CheatingDaddyApp extends LitElement {
 
     async handleClose() {
         if (this.currentView === 'assistant') {
-            cheatingDaddy.stopCapture();
-            if (window.require) {
-                const { ipcRenderer } = window.require('electron');
-                await ipcRenderer.invoke('close-session');
-            }
+            if (this._sessionController) await this._sessionController.stop();
+            else await this._stopMeetingResources();
             this.sessionActive = false;
             this._stopTimer();
             this.currentView = 'main';
@@ -639,52 +694,70 @@ export class CheatingDaddyApp extends LitElement {
 
     // ── Session start ──
 
+    _ensureSessionController() {
+        if (this._sessionController) return this._sessionController;
+        const { SessionController } = window.require('./utils/sessionController');
+        this._sessionController = new SessionController({
+            startProvider: async (generation, options) => this._startProvider(options),
+            startCapture: async () => {
+                const capture = await cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
+                if (!capture.success) throw new Error(capture.error || 'Audio capture failed');
+                return capture;
+            },
+            stopProvider: async () => {
+                if (!window.require) return;
+                const { ipcRenderer } = window.require('electron');
+                await ipcRenderer.invoke('close-session');
+            },
+            stopCapture: async () => cheatingDaddy.stopCapture(),
+            onStateChange: state => {
+                this.isRecording = state === 'active';
+                this.requestUpdate();
+            },
+        });
+        return this._sessionController;
+    }
+
+    async _startProvider({ providerMode, preferences }) {
+        if (providerMode === 'cloud') {
+            const creds = await cheatingDaddy.storage.getCredentials();
+            if (!creds.cloudToken?.trim()) throw new Error('Cloud token is required');
+            if (!(await cheatingDaddy.initializeCloud(this.selectedProfile))) throw new Error('Cloud connection failed');
+            return 'cloud';
+        }
+        if (providerMode === 'local') {
+            if (!(await cheatingDaddy.initializeLocal(this.selectedProfile))) throw new Error('Local AI failed to start');
+            return 'local';
+        }
+        const apiKey = await cheatingDaddy.storage.getApiKey();
+        if (!apiKey) throw new Error('Gemini API key is required');
+        if (!(await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage))) throw new Error('Gemini failed to connect');
+        return 'byok';
+    }
+
+    async _stopMeetingResources() {
+        await cheatingDaddy.stopCapture();
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            await ipcRenderer.invoke('close-session');
+        }
+    }
+
     async handleStart() {
         const prefs = await cheatingDaddy.storage.getPreferences();
         const providerMode = prefs.providerMode || 'cloud';
-
-        if (providerMode === 'cloud') {
-            const creds = await cheatingDaddy.storage.getCredentials();
-            if (!creds.cloudToken || creds.cloudToken.trim() === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-
-            const success = await cheatingDaddy.initializeCloud(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-        } else if (providerMode === 'local') {
-            const success = await cheatingDaddy.initializeLocal(this.selectedProfile);
-            if (!success) {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-        } else {
-            const apiKey = await cheatingDaddy.storage.getApiKey();
-            if (!apiKey || apiKey === '') {
-                const mainView = this.shadowRoot.querySelector('main-view');
-                if (mainView && mainView.triggerApiKeyError) {
-                    mainView.triggerApiKeyError();
-                }
-                return;
-            }
-
-            await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
+        const result = await this._ensureSessionController().start({ providerMode, preferences: prefs });
+        if (!result.success) {
+            this.setStatus(result.error || 'Meeting failed to start');
+            const mainView = this.shadowRoot.querySelector('main-view');
+            mainView?.triggerApiKeyError?.();
+            return;
         }
-
-        cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);
         this.responses = [];
+        this._answerTurnIds = [];
+        this._answerSequences = {};
+        this._pendingAnswerEvents.clear();
+        this.responseNumberOffset = 0;
         this.currentResponseIndex = -1;
         this.startTime = Date.now();
         this.sessionActive = true;
@@ -757,6 +830,7 @@ export class CheatingDaddyApp extends LitElement {
             this.setStatus('Message sent...');
             this._awaitingNewResponse = true;
         }
+        return result;
     }
 
     handleResponseIndexChanged(e) {
@@ -841,6 +915,7 @@ export class CheatingDaddyApp extends LitElement {
                 return html`
                     <assistant-view
                         .responses=${this.responses}
+                        .responseNumberOffset=${this.responseNumberOffset}
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}
                         .onSendText=${msg => this.handleSendText(msg)}

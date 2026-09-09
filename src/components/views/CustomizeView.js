@@ -206,7 +206,7 @@ export class CustomizeView extends LitElement {
         this.onLanguageChange = () => {};
         this.onImageQualityChange = () => {};
         this.onLayoutModeChange = () => {};
-        this.googleSearchEnabled = true;
+        this.googleSearchEnabled = false;
         this.isClearing = false;
         this.isRestoring = false;
         this.clearStatusMessage = '';
@@ -214,6 +214,7 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
+        this.vadPreset = 'fast';
         this.customPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
@@ -226,10 +227,11 @@ export class CustomizeView extends LitElement {
     async _loadFromStorage() {
         try {
             const [prefs, keybinds] = await Promise.all([cheatingDaddy.storage.getPreferences(), cheatingDaddy.storage.getKeybinds()]);
-            this.googleSearchEnabled = prefs.googleSearchEnabled ?? true;
+            this.googleSearchEnabled = prefs.googleSearchEnabled ?? false;
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
+            this.vadPreset = prefs.vadPreset ?? 'fast';
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
@@ -368,6 +370,12 @@ export class CustomizeView extends LitElement {
     async handleAudioModeSelect(e) {
         this.audioMode = e.target.value;
         await cheatingDaddy.storage.updatePreference('audioMode', this.audioMode);
+        this.requestUpdate();
+    }
+
+    async handleVadPresetSelect(e) {
+        this.vadPreset = e.target.value;
+        await cheatingDaddy.storage.updatePreference('vadPreset', this.vadPreset);
         this.requestUpdate();
     }
 
@@ -595,6 +603,13 @@ export class CustomizeView extends LitElement {
                             <option value="speaker_only">Speaker Only (Interviewer)</option>
                             <option value="mic_only">Microphone Only (Me)</option>
                             <option value="both">Both Speaker and Microphone</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Pause sensitivity</label>
+                        <select class="control" .value=${this.vadPreset} @change=${this.handleVadPresetSelect}>
+                            <option value="fast">Fast (600 / 800 ms)</option>
+                            <option value="patient">Patient (900 / 1200 ms)</option>
                         </select>
                     </div>
                     ${

@@ -1,5 +1,7 @@
 const WebSocket = require('ws');
 const { BrowserWindow } = require('electron');
+const { createTurnId, emitAnswer } = require('./answerEvents');
+const { ConnectionGeneration } = require('./connectionGeneration');
 
 let cloudWs = null;
 let isCloudConnected = false;
@@ -8,6 +10,9 @@ let currentTranscription = '';
 let isFirstChunk = true;
 let audioChunkCount = 0;
 let onTurnComplete = null;
+let currentTurnId = null;
+let answerSequence = 0;
+const cloudConnections = new ConnectionGeneration();
 
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
@@ -21,6 +26,7 @@ function setOnTurnComplete(callback) {
 }
 
 function connectCloud(token, profile, userContext) {
+    const generation = cloudConnections.begin();
     // Close existing connection
     if (cloudWs) {
         try {
@@ -46,6 +52,7 @@ function connectCloud(token, profile, userContext) {
         }, 10000);
 
         cloudWs.on('open', () => {
+            if (!cloudConnections.isCurrent(generation)) return;
             console.log('[Cloud] WebSocket open');
             isCloudConnected = true;
             clearTimeout(timeout);
@@ -64,6 +71,7 @@ function connectCloud(token, profile, userContext) {
         });
 
         cloudWs.on('message', data => {
+            if (!cloudConnections.isCurrent(generation)) return;
             try {
                 const msg = JSON.parse(data.toString());
                 handleMessage(msg);
@@ -73,6 +81,7 @@ function connectCloud(token, profile, userContext) {
         });
 
         cloudWs.on('close', (code, reason) => {
+            if (!cloudConnections.isCurrent(generation)) return;
             console.log('[Cloud] WebSocket closed:', code, reason.toString());
             console.log('[Cloud] Audio chunks sent before close:', audioChunkCount);
             isCloudConnected = false;
@@ -80,6 +89,7 @@ function connectCloud(token, profile, userContext) {
         });
 
         cloudWs.on('error', err => {
+            if (!cloudConnections.isCurrent(generation)) return;
             console.error('[Cloud] WebSocket error:', err.message);
             isCloudConnected = false;
             clearTimeout(timeout);
@@ -103,19 +113,26 @@ function handleMessage(msg) {
         case 'response_start':
             currentCloudResponse = '';
             isFirstChunk = true;
+            currentTurnId = createTurnId('cloud');
+            answerSequence = 0;
             break;
 
         case 'response_chunk':
             currentCloudResponse += msg.text;
-            sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', currentCloudResponse);
+            if (!currentTurnId) currentTurnId = createTurnId('cloud');
+            emitAnswer(sendToRenderer, currentTurnId, isFirstChunk ? 'start' : 'update', currentCloudResponse, answerSequence++);
             isFirstChunk = false;
             break;
 
         case 'response_end':
+            if (currentTurnId && currentCloudResponse.trim()) {
+                emitAnswer(sendToRenderer, currentTurnId, 'complete', currentCloudResponse, answerSequence++);
+            }
             if (onTurnComplete && currentCloudResponse.trim()) {
                 onTurnComplete(currentTranscription, currentCloudResponse);
             }
             currentTranscription = '';
+            currentTurnId = null;
             sendToRenderer('update-status', 'Listening...');
             break;
 
@@ -136,7 +153,11 @@ function handleMessage(msg) {
 
 function sendCloudAudio(pcmBuffer) {
     if (!cloudWs || !isCloudConnected || cloudWs.readyState !== WebSocket.OPEN) {
-        return;
+        return false;
+    }
+    if (cloudWs.bufferedAmount > 96000) {
+        console.warn('[Cloud] Dropping stale audio because the connection is congested');
+        return false;
     }
 
     cloudWs.send(pcmBuffer, { binary: true }, err => {
@@ -146,7 +167,7 @@ function sendCloudAudio(pcmBuffer) {
     });
 
     audioChunkCount++;
-    process.stdout.write('.');
+    return true;
 }
 
 function sendCloudText(text) {
@@ -176,6 +197,7 @@ function sendCloudImage(base64Data) {
 }
 
 function closeCloud() {
+    cloudConnections.stop();
     console.log('[Cloud] Closing. Audio chunks sent:', audioChunkCount);
     if (cloudWs) {
         try {

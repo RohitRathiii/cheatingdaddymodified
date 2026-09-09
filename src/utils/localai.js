@@ -1,6 +1,23 @@
 const { Ollama } = require('ollama');
 const { getSystemPrompt } = require('./prompts');
 const { sendToRenderer, initializeNewSession, saveConversationTurn } = require('./gemini');
+const { createTurnId, emitAnswer } = require('./answerEvents');
+const { removeTranscriptOverlap } = require('./transcriptOverlap');
+
+function createLocalAnswerStream(prefix) {
+    const turnId = createTurnId(prefix);
+    let sequence = 0;
+    let started = false;
+    return {
+        update(text) {
+            emitAnswer(sendToRenderer, turnId, started ? 'update' : 'start', text, sequence++);
+            started = true;
+        },
+        complete(text) {
+            emitAnswer(sendToRenderer, turnId, 'complete', text, sequence++);
+        },
+    };
+}
 
 // ── State ──
 
@@ -17,6 +34,29 @@ let isSpeaking = false;
 let speechBuffers = [];
 let silenceFrameCount = 0;
 let speechFrameCount = 0;
+let speechBytes = 0;
+let transcriptionJobActive = false;
+let transcriptionJobs = [];
+let transcriptionGeneration = 0;
+let previousSegmentTranscript = '';
+const MAX_SEGMENT_BYTES = 16000 * 2 * 20;
+const OVERLAP_BYTES = 16000 * 2 * 0.5;
+
+function queueTranscriptionJob(audioData) {
+    if (transcriptionJobs.length >= 2) transcriptionJobs.shift();
+    transcriptionJobs.push({ audioData, generation: transcriptionGeneration });
+    drainTranscriptionJobs();
+}
+
+async function drainTranscriptionJobs() {
+    if (transcriptionJobActive) return;
+    transcriptionJobActive = true;
+    while (transcriptionJobs.length) {
+        const job = transcriptionJobs.shift();
+        if (job.generation === transcriptionGeneration) await handleSpeechEnd(job.audioData);
+    }
+    transcriptionJobActive = false;
+}
 
 // VAD configuration
 const VAD_MODES = {
@@ -84,6 +124,7 @@ function processVAD(pcm16kBuffer) {
         if (!isSpeaking && speechFrameCount >= vadConfig.speechFramesRequired) {
             isSpeaking = true;
             speechBuffers = [];
+            speechBytes = 0;
             console.log('[LocalAI] Speech started (RMS:', rms.toFixed(4), ')');
             sendToRenderer('update-status', 'Listening... (speech detected)');
         }
@@ -99,14 +140,24 @@ function processVAD(pcm16kBuffer) {
             // Trigger transcription with accumulated audio
             const audioData = Buffer.concat(speechBuffers);
             speechBuffers = [];
-            handleSpeechEnd(audioData);
+            speechBytes = 0;
+            queueTranscriptionJob(audioData);
             return;
         }
     }
 
     // Accumulate audio during speech
     if (isSpeaking) {
-        speechBuffers.push(Buffer.from(pcm16kBuffer));
+        const frame = Buffer.from(pcm16kBuffer);
+        speechBuffers.push(frame);
+        speechBytes += frame.length;
+        if (speechBytes >= MAX_SEGMENT_BYTES) {
+            const combined = Buffer.concat(speechBuffers);
+            queueTranscriptionJob(combined.subarray(0, MAX_SEGMENT_BYTES));
+            const overlap = combined.subarray(Math.max(0, MAX_SEGMENT_BYTES - OVERLAP_BYTES));
+            speechBuffers = [Buffer.from(overlap)];
+            speechBytes = overlap.length;
+        }
     }
 }
 
@@ -191,7 +242,9 @@ async function handleSpeechEnd(audioData) {
         return;
     }
 
-    const transcription = await transcribeAudio(audioData);
+    const rawTranscription = await transcribeAudio(audioData);
+    const transcription = removeTranscriptOverlap(previousSegmentTranscript, rawTranscription || '');
+    previousSegmentTranscript = rawTranscription || previousSegmentTranscript;
 
     if (!transcription || transcription.trim() === '' || transcription.trim().length < 2) {
         console.log('[LocalAI] Empty transcription, skipping');
@@ -206,6 +259,7 @@ async function handleSpeechEnd(audioData) {
 // ── Ollama Chat ──
 
 async function sendToOllama(transcription) {
+    const answer = createLocalAnswerStream('local');
     if (!ollamaClient || !ollamaModel) {
         console.error('[LocalAI] Ollama not configured');
         return;
@@ -242,12 +296,13 @@ async function sendToOllama(transcription) {
             const token = part.message?.content || '';
             if (token) {
                 fullText += token;
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                answer.update(fullText);
                 isFirst = false;
             }
         }
 
         if (fullText.trim()) {
+            answer.complete(fullText.trim());
             localConversationHistory.push({
                 role: 'assistant',
                 content: fullText.trim(),
@@ -322,11 +377,10 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
     }
 }
 
-function processLocalAudio(monoChunk24k) {
+function processLocalAudio(monoChunk, sampleRate = 24000) {
     if (!isLocalActive) return;
 
-    // Resample from 24kHz to 16kHz
-    const pcm16k = resample24kTo16k(monoChunk24k);
+    const pcm16k = sampleRate === 16000 ? monoChunk : resample24kTo16k(monoChunk);
     if (pcm16k.length > 0) {
         processVAD(pcm16k);
     }
@@ -337,6 +391,10 @@ function closeLocalSession() {
     isLocalActive = false;
     isSpeaking = false;
     speechBuffers = [];
+    speechBytes = 0;
+    transcriptionGeneration++;
+    transcriptionJobs = [];
+    previousSegmentTranscript = '';
     silenceFrameCount = 0;
     speechFrameCount = 0;
     resampleRemainder = Buffer.alloc(0);
@@ -367,6 +425,7 @@ async function sendLocalText(text) {
 }
 
 async function sendLocalImage(base64Data, prompt) {
+    const answer = createLocalAnswerStream('local-screen');
     if (!isLocalActive || !ollamaClient) {
         return { success: false, error: 'No active local session' };
     }
@@ -407,12 +466,13 @@ async function sendLocalImage(base64Data, prompt) {
             const token = part.message?.content || '';
             if (token) {
                 fullText += token;
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                answer.update(fullText);
                 isFirst = false;
             }
         }
 
         if (fullText.trim()) {
+            answer.complete(fullText.trim());
             localConversationHistory.push({ role: 'assistant', content: fullText.trim() });
             saveConversationTurn(prompt, fullText);
         }

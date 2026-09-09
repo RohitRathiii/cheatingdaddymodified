@@ -34,15 +34,14 @@ test('buildLiveAnalyzeClientContent completes a user turn with the image', () =>
     assert.equal(payload.turns[0].parts[1].text, 'What is on screen?');
 });
 
-test('sendForcedLiveScreenTurn uses sendClientContent with turnComplete', () => {
+test('sendForcedLiveScreenTurn uses realtime media and text without manual activity messages', () => {
     const { sendForcedLiveScreenTurn } = require('./analyzeScreenSend');
     const calls = [];
     const session = {
-        sendClientContent: payload => calls.push(payload),
+        sendRealtimeInput: payload => calls.push(payload),
     };
     const result = sendForcedLiveScreenTurn(session, 'img', 'Read this');
     assert.equal(result.success, true);
-    assert.equal(result.mode, 'client-content');
-    assert.equal(calls[0].turnComplete, true);
-    assert.equal(calls[0].turns[0].parts[1].text, 'Read this');
+    assert.equal(result.mode, 'realtime');
+    assert.deepEqual(calls, [{ media: { data: 'img', mimeType: 'image/jpeg' } }, { text: 'Read this' }]);
 });

@@ -2,7 +2,8 @@ if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, Tray, Menu, dialog } = require('electron');
+const path = require('node:path');
 
 // Electron 29.1+ ScreenCaptureKit thumbnails are empty on macOS. Disable that path
 // so Analyze Screen can get a real JPEG. https://github.com/electron/electron/issues/44504
@@ -17,15 +18,85 @@ if (process.platform === 'win32') {
     app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 }
 
-const { createWindow, updateGlobalShortcuts } = require('./utils/window');
+const { createWindow } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { startDiagnostics } = require('./utils/diagnostics');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
+let tray = null;
+let stopDiagnostics = null;
+let rendererReady = false;
+let recoveringRenderer = false;
+
+function showMainWindow() {
+    if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createMainWindow();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.moveTop?.();
+}
+
+function createTray() {
+    if (tray) return;
+    const icon = path.join(__dirname, 'assets', process.platform === 'win32' ? 'logo.ico' : 'logo.png');
+    tray = new Tray(icon);
+    tray.setToolTip('Cheating Daddy');
+    tray.setContextMenu(
+        Menu.buildFromTemplate([
+            { label: 'Show', click: showMainWindow },
+            {
+                label: 'Stop meeting',
+                click: () => mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.send('stop-meeting-requested'),
+            },
+            { type: 'separator' },
+            { label: 'Quit', click: () => app.quit() },
+        ])
+    );
+    tray.on('double-click', showMainWindow);
+}
+
+function recoverFromRendererFailure(reason) {
+    if (recoveringRenderer) return;
+    recoveringRenderer = true;
+    stopMacOSAudioCapture();
+    try {
+        geminiSessionRef.current?.close?.();
+    } catch (_) {}
+    geminiSessionRef.current = null;
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isCrashed()) {
+        mainWindow.webContents.send('stop-meeting-requested');
+        mainWindow.webContents.forcefullyCrashRenderer();
+    }
+    dialog.showMessageBox({
+        type: 'error',
+        title: 'The meeting window stopped responding',
+        message: `Capture was stopped to protect your privacy. ${reason}`,
+        buttons: ['Reload window', 'Quit'],
+    }).then(({ response }) => {
+        if (response === 0 && mainWindow && !mainWindow.isDestroyed()) {
+            recoveringRenderer = false;
+            mainWindow.reload();
+        }
+        else if (response === 1) app.quit();
+    });
+}
 
 function createMainWindow() {
+    rendererReady = false;
     mainWindow = createWindow(sendToRenderer, geminiSessionRef);
+    mainWindow.webContents.on('did-fail-load', (_event, code, description) => recoverFromRendererFailure(`Page load failed (${code}: ${description}).`));
+    mainWindow.webContents.on('render-process-gone', (_event, details) => recoverFromRendererFailure(`Renderer exited: ${details.reason}.`));
+    mainWindow.on('unresponsive', () => recoverFromRendererFailure('You can reload the interface and start capture again.'));
+    mainWindow.once('closed', () => {
+        mainWindow = null;
+    });
+    setTimeout(() => {
+        if (!rendererReady && mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show();
+            console.warn('Renderer-ready handshake timed out; keeping the recovery window visible');
+        }
+    }, 10000).unref?.();
     return mainWindow;
 }
 
@@ -40,6 +111,8 @@ app.whenReady().then(async () => {
     }
 
     createMainWindow();
+    createTray();
+    stopDiagnostics = startDiagnostics({ app, BrowserWindow, directory: path.join(app.getPath('logs'), 'diagnostics') });
     setupGeminiIpcHandlers(geminiSessionRef);
     setupStorageIpcHandlers();
     setupGeneralIpcHandlers();
@@ -53,6 +126,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+    stopDiagnostics?.();
     stopMacOSAudioCapture();
     try {
         require('./utils/optionTapMonitor').stopOptionTapMonitor();
@@ -209,7 +283,7 @@ function setupStorageIpcHandlers() {
     // ============ HISTORY ============
     ipcMain.handle('storage:get-all-sessions', async () => {
         try {
-            return { success: true, data: storage.getAllSessions() };
+            return { success: true, data: await storage.getArchivedSessions() };
         } catch (error) {
             console.error('Error getting sessions:', error);
             return { success: false, error: error.message };
@@ -218,26 +292,24 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:get-session', async (event, sessionId) => {
         try {
-            return { success: true, data: storage.getSession(sessionId) };
+            return { success: true, data: await storage.getArchivedSession(sessionId) };
         } catch (error) {
             console.error('Error getting session:', error);
             return { success: false, error: error.message };
         }
     });
 
-    ipcMain.handle('storage:save-session', async (event, sessionId, data) => {
+    ipcMain.handle('storage:get-session-page', async (_event, sessionId, cursor, pageSize) => {
         try {
-            storage.saveSession(sessionId, data);
-            return { success: true };
+            return { success: true, data: await storage.getSessionPage(sessionId, { cursor, limit: pageSize }) };
         } catch (error) {
-            console.error('Error saving session:', error);
             return { success: false, error: error.message };
         }
     });
 
     ipcMain.handle('storage:delete-session', async (event, sessionId) => {
         try {
-            storage.deleteSession(sessionId);
+            await storage.deleteArchivedSession(sessionId);
             return { success: true };
         } catch (error) {
             console.error('Error deleting session:', error);
@@ -247,7 +319,7 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:delete-all-sessions', async () => {
         try {
-            storage.deleteAllSessions();
+            await storage.deleteAllArchivedSessions();
             return { success: true };
         } catch (error) {
             console.error('Error deleting all sessions:', error);
@@ -278,6 +350,9 @@ function setupStorageIpcHandlers() {
 }
 
 function setupGeneralIpcHandlers() {
+    ipcMain.on('renderer-ready', event => {
+        if (mainWindow && event.sender === mainWindow.webContents) rendererReady = true;
+    });
     ipcMain.handle('get-app-version', async () => {
         return app.getVersion();
     });
@@ -300,14 +375,6 @@ function setupGeneralIpcHandlers() {
         } catch (error) {
             console.error('Error opening external URL:', error);
             return { success: false, error: error.message };
-        }
-    });
-
-    ipcMain.on('update-keybinds', (event, newKeybinds) => {
-        if (mainWindow) {
-            // Also save to storage
-            storage.setKeybinds(newKeybinds);
-            updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
         }
     });
 

@@ -11,10 +11,13 @@ const {
     getOverlayBackgroundColor,
     shouldShowWindowOnCreate,
 } = require('./overlayVisibility');
+const { clampBoundsToWorkArea } = require('./windowBounds');
 
 let mouseEventsIgnored = false;
 let stealthHidden = false;
 let lastVisibilityToggleAt = 0;
+let windowIpcContext = null;
+let windowIpcRegistered = false;
 
 function isOverlayShown(mainWindow) {
     return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !stealthHidden);
@@ -76,12 +79,20 @@ function setWindowFrame(mainWindow, width, height, x, y) {
 function getTopCenteredBounds(width, height) {
     const primaryDisplay = screen.getPrimaryDisplay();
     const workArea = primaryDisplay.workArea || { x: 0, y: 0, ...primaryDisplay.workAreaSize };
-    return {
+    return clampBoundsToWorkArea({
         x: workArea.x + Math.floor((workArea.width - width) / 2),
         y: workArea.y,
         width,
         height,
-    };
+    }, workArea);
+}
+
+function keepWindowOnScreen(mainWindow) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const bounds = mainWindow.getBounds();
+    const display = screen.getDisplayMatching(bounds) || screen.getPrimaryDisplay();
+    const next = clampBoundsToWorkArea(bounds, display.workArea);
+    if (Object.keys(next).some(key => next[key] !== bounds[key])) mainWindow.setBounds(next);
 }
 
 function toggleOverlayVisibility(mainWindow) {
@@ -206,6 +217,16 @@ function createWindow(sendToRenderer, geminiSessionRef) {
     }
 
     mainWindow.loadFile(path.join(__dirname, '../index.html'));
+
+    const displayChanged = () => keepWindowOnScreen(mainWindow);
+    screen.on('display-removed', displayChanged);
+    screen.on('display-metrics-changed', displayChanged);
+    mainWindow.once('closed', () => {
+        screen.removeListener('display-removed', displayChanged);
+        screen.removeListener('display-metrics-changed', displayChanged);
+        stopOptionTapMonitor();
+        globalShortcut.unregisterAll();
+    });
 
     mainWindow.webContents.once('dom-ready', () => {
         startHideShortcut();
@@ -434,7 +455,12 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 }
 
 function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
+    windowIpcContext = { mainWindow, sendToRenderer, geminiSessionRef };
+    if (windowIpcRegistered) return;
+    windowIpcRegistered = true;
     ipcMain.on('view-changed', (event, view) => {
+        const { mainWindow } = windowIpcContext || {};
+        if (!mainWindow) return;
         if (!mainWindow.isDestroyed()) {
             if (view === 'assistant') {
                 const live = getTopCenteredBounds(850, 400);
@@ -448,12 +474,16 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     });
 
     ipcMain.handle('window-minimize', () => {
+        const { mainWindow } = windowIpcContext || {};
+        if (!mainWindow) return;
         if (!mainWindow.isDestroyed()) {
             mainWindow.minimize();
         }
     });
 
     ipcMain.on('update-keybinds', (event, newKeybinds) => {
+        const { mainWindow, sendToRenderer, geminiSessionRef } = windowIpcContext || {};
+        if (!mainWindow) return;
         if (!mainWindow.isDestroyed()) {
             updateGlobalShortcuts(newKeybinds, mainWindow, sendToRenderer, geminiSessionRef);
         }
@@ -461,6 +491,8 @@ function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
 
     ipcMain.handle('toggle-window-visibility', async event => {
         try {
+            const { mainWindow } = windowIpcContext || {};
+            if (!mainWindow) return { success: false, error: 'Window is unavailable' };
             if (mainWindow.isDestroyed()) {
                 return { success: false, error: 'Window has been destroyed' };
             }
@@ -488,4 +520,5 @@ module.exports = {
     toggleOverlayVisibility,
     hideOverlayWindow,
     showOverlayWindow,
+    keepWindowOnScreen,
 };

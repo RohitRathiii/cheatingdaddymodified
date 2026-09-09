@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { HistoryStore } = require('./utils/historyStore');
 
 const CONFIG_VERSION = 1;
 
@@ -27,6 +28,7 @@ const DEFAULT_PREFERENCES = {
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
+    vadPreset: 'fast',
     ollamaHost: 'http://127.0.0.1:11434',
     ollamaModel: 'llama3.1',
     whisperModel: 'Xenova/whisper-small',
@@ -77,6 +79,44 @@ function getLimitsPath() {
 
 function getHistoryDir() {
     return path.join(getConfigDir(), 'history');
+}
+
+let incrementalHistoryStore = null;
+function getIncrementalHistoryStore() {
+    if (!incrementalHistoryStore) incrementalHistoryStore = new HistoryStore({ root: getHistoryDir() });
+    return incrementalHistoryStore;
+}
+
+async function startSessionArchive(metadata) {
+    return getIncrementalHistoryStore().startSession(metadata);
+}
+
+async function appendSessionRecord(sessionId, record) {
+    return getIncrementalHistoryStore().append(sessionId, record);
+}
+
+async function flushSessionArchive(sessionId) {
+    return getIncrementalHistoryStore().flush(sessionId);
+}
+
+async function getSessionPage(sessionId, options) {
+    return getIncrementalHistoryStore().readPage(sessionId, options);
+}
+
+async function getArchivedSession(sessionId) {
+    return getIncrementalHistoryStore().readSession(sessionId);
+}
+
+async function getArchivedSessions() {
+    return getIncrementalHistoryStore().listSessions();
+}
+
+async function deleteArchivedSession(sessionId) {
+    return getIncrementalHistoryStore().deleteSession(sessionId);
+}
+
+async function deleteAllArchivedSessions() {
+    return getIncrementalHistoryStore().deleteAll();
 }
 
 // Helper to read JSON file safely
@@ -148,7 +188,12 @@ function resetConfigDir() {
 // Initialize storage - call this on app startup
 function initializeStorage() {
     if (needsReset()) {
-        resetConfigDir();
+        const configDir = getConfigDir();
+        fs.mkdirSync(configDir, { recursive: true });
+        fs.mkdirSync(getHistoryDir(), { recursive: true });
+        setConfig(readJsonFile(getConfigPath(), DEFAULT_CONFIG));
+        setCredentials(readJsonFile(getCredentialsPath(), DEFAULT_CREDENTIALS));
+        setPreferences(readJsonFile(getPreferencesPath(), DEFAULT_PREFERENCES));
     } else {
         // Ensure history directory exists
         const historyDir = getHistoryDir();
@@ -487,6 +532,15 @@ module.exports = {
     // Initialization
     initializeStorage,
     getConfigDir,
+    getHistoryDir,
+    startSessionArchive,
+    appendSessionRecord,
+    flushSessionArchive,
+    getSessionPage,
+    getArchivedSession,
+    getArchivedSessions,
+    deleteArchivedSession,
+    deleteAllArchivedSessions,
 
     // Config
     getConfig,

@@ -265,6 +265,7 @@ export class HistoryView extends LitElement {
         loading: { type: Boolean },
         activeTab: { type: String },
         searchQuery: { type: String },
+        hasMoreRecords: { type: Boolean },
     };
 
     constructor() {
@@ -275,6 +276,8 @@ export class HistoryView extends LitElement {
         this.loading = true;
         this.activeTab = 'conversation';
         this.searchQuery = '';
+        this.hasMoreRecords = false;
+        this.nextCursor = null;
         this.loadSessions();
     }
 
@@ -293,16 +296,42 @@ export class HistoryView extends LitElement {
 
     async openSession(sessionId) {
         try {
-            const session = await cheatingDaddy.storage.getSession(sessionId);
-            if (session) {
-                this.selectedSession = session;
+            const page = await cheatingDaddy.storage.getSessionPage(sessionId, 0, 50);
+            if (page) {
+                const metadata = this.sessions.find(item => item.sessionId === sessionId) || { sessionId, createdAt: Number(sessionId) };
+                this.selectedSession = this._sessionFromRecords(metadata, page.records || []);
                 this.selectedSessionId = sessionId;
+                this.nextCursor = page.nextCursor;
+                this.hasMoreRecords = page.nextCursor != null;
                 this.activeTab = 'conversation';
                 this.requestUpdate();
             }
         } catch (error) {
             console.error('Error loading session:', error);
         }
+    }
+
+    _sessionFromRecords(metadata, records) {
+        return {
+            ...metadata,
+            conversationHistory: records.filter(record => record.type === 'turn'),
+            screenAnalysisHistory: records.filter(record => record.type === 'screen'),
+            summary: records.filter(record => record.type === 'summary').at(-1)?.summary || '',
+        };
+    }
+
+    async loadMoreRecords() {
+        if (this.nextCursor == null || !this.selectedSessionId) return;
+        const page = await cheatingDaddy.storage.getSessionPage(this.selectedSessionId, this.nextCursor, 50);
+        const added = this._sessionFromRecords({}, page.records || []);
+        this.selectedSession = {
+            ...this.selectedSession,
+            conversationHistory: [...this.selectedSession.conversationHistory, ...added.conversationHistory],
+            screenAnalysisHistory: [...this.selectedSession.screenAnalysisHistory, ...added.screenAnalysisHistory],
+            summary: added.summary || this.selectedSession.summary,
+        };
+        this.nextCursor = page.nextCursor;
+        this.hasMoreRecords = page.nextCursor != null;
     }
 
     closeSession() {
@@ -541,7 +570,10 @@ export class HistoryView extends LitElement {
                     Context
                 </button>
             </div>
-            <section class="details-scroll">${this.renderTabContent()}</section>
+            <section class="details-scroll">
+                ${this.renderTabContent()}
+                ${this.hasMoreRecords ? html`<button class="back-btn" @click=${this.loadMoreRecords}>Load 50 more</button>` : ''}
+            </section>
         `;
     }
 

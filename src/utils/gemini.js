@@ -1,12 +1,30 @@
-const { GoogleGenAI, Modality } = require('@google/genai');
+const { GoogleGenAI } = require('@google/genai');
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getModelForToday } = require('../storage');
+const {
+    getAvailableModel,
+    incrementLimitCount,
+    getApiKey,
+    getGroqApiKey,
+    incrementCharUsage,
+    getModelForToday,
+    getPreferences,
+    startSessionArchive,
+    appendSessionRecord,
+    flushSessionArchive,
+    getArchivedSession,
+} = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { captureScreenStill } = require('./screenStill');
 const { chooseAnalyzeScreenPath, sendForcedLiveScreenTurn } = require('./analyzeScreenSend');
+const { BoundedAudioQueue, validateAudioFrame } = require('./audioPipeline');
+const { ConnectionGeneration } = require('./connectionGeneration');
+const { createTurnId, emitAnswer } = require('./answerEvents');
+const { buildRelevantContext } = require('./historyStore');
+const { BoundedTurnQueue } = require('./boundedTurnQueue');
+const { connectGeminiLive } = require('./geminiLiveTransport');
 
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
@@ -30,8 +48,30 @@ let currentProfile = null;
 let currentCustomPrompt = null;
 let isInitializingSession = false;
 let currentSystemPrompt = null;
+let conversationSequence = 0;
+let screenSequence = 0;
+let transcriptSequence = 0;
+let currentSummary = '';
+let completedTurnsSinceSummary = 0;
+let lastSummaryAt = 0;
+let summaryInFlight = false;
 
 const GEMINI_LIVE_MODEL = 'gemini-3.1-flash-live-preview';
+
+function createAnswerStream(prefix) {
+    const turnId = createTurnId(prefix);
+    let sequence = 0;
+    let started = false;
+    return {
+        update(text) {
+            emitAnswer(sendToRenderer, turnId, started ? 'update' : 'start', text, sequence++);
+            started = true;
+        },
+        complete(text, status = 'complete') {
+            emitAnswer(sendToRenderer, turnId, status, text, sequence++);
+        },
+    };
+}
 
 function formatSpeakerResults(results) {
     let text = '';
@@ -101,7 +141,9 @@ function ingestLiveOutputTranscription(message) {
     }
 
     liveOutputText = mergeLiveInputTranscription(liveOutputText, incoming);
-    sendToRenderer(liveOutputStarted ? 'update-response' : 'new-response', liveOutputText);
+    liveTurnActive = true;
+    if (!liveTurnId) liveTurnId = createTurnId('live');
+    emitAnswer(sendToRenderer, liveTurnId, liveOutputStarted ? 'update' : 'start', liveOutputText, liveOutputSequence++);
     liveOutputStarted = true;
     sendToRenderer('update-status', 'Responding...');
     return true;
@@ -110,20 +152,36 @@ function ingestLiveOutputTranscription(message) {
 function finalizeLiveConversationTurn() {
     const input = currentTranscription.trim();
     const output = liveOutputText.trim();
+    if (input && currentSessionId) {
+        appendSessionRecord(currentSessionId, {
+            id: `${currentSessionId}:transcript:${++transcriptSequence}`,
+            type: 'transcript',
+            timestamp: Date.now(),
+            transcription: input,
+        }).catch(error => sendToRenderer('update-status', `History error: ${error.message}`));
+    }
     if (output) {
+        if (!liveTurnId) liveTurnId = createTurnId('live');
+        emitAnswer(sendToRenderer, liveTurnId, 'complete', output, liveOutputSequence++);
         saveConversationTurn(input || '(audio)', output);
     }
     currentTranscription = '';
     liveOutputText = '';
     liveOutputStarted = false;
+    liveTurnId = null;
+    liveOutputSequence = 0;
     messageBuffer = '';
     awaitingLateTranscript = false;
+    liveTurnActive = false;
+    dispatchNextTypedTurn();
 }
 
 function resetLiveConversationBuffers() {
     currentTranscription = '';
     liveOutputText = '';
     liveOutputStarted = false;
+    liveTurnId = null;
+    liveOutputSequence = 0;
     messageBuffer = '';
     awaitingLateTranscript = false;
     clearTranscriptionSilenceTimer();
@@ -136,7 +194,14 @@ let messageBuffer = '';
 
 // Gemini audio send serialization
 let geminiSendLock = false;
-let geminiAudioQueue = [];
+const geminiAudioQueue = new BoundedAudioQueue({
+    sampleRate: 16000,
+    maxDurationMs: 2000,
+    onGap: gap => console.warn('Dropped stale Gemini audio frame:', gap.sequence),
+});
+let geminiAudioSequence = 0;
+let congestionStartedAt = 0;
+let congestionRetryTimer = null;
 let liveResampleRemainder = Buffer.alloc(0);
 let liveHadSpeech = false;
 let liveSilenceMs = 0;
@@ -145,14 +210,29 @@ const LIVE_SILENCE_END_MS = 700;
 const LIVE_SPEECH_RMS = 0.008;
 let sessionResumptionHandle = null;
 let reconnectInFlight = false;
+const liveConnections = new ConnectionGeneration();
 let pendingLiveImage = null;
 let liveImageSendInFlight = false;
 let lastScreenshotJpeg = null;
 let pendingTypedQuestion = null;
+const typedTurnQueue = new BoundedTurnQueue(3);
+let liveTurnActive = false;
+let liveTurnId = null;
+let liveOutputSequence = 0;
+global.getMeetingDiagnostics = () => ({
+    providerMode: currentProviderMode,
+    audioQueueFrames: geminiAudioQueue.length,
+    audioQueueMs: Math.round(geminiAudioQueue.durationMs),
+    typedQueue: typedTurnQueue.length,
+    reconnecting: reconnectInFlight,
+    summaryRunning: summaryInFlight,
+});
 
 // 3.1 batches inputTranscription after the utterance, so this timer starts
 // once the full text arrives — not mid-sentence like 2.5 incremental chunks.
-const SILENCE_TIMEOUT_MS = 600;
+function clientSilenceTimeoutMs() {
+    return getPreferences().vadPreset === 'patient' ? 900 : 600;
+}
 const LATE_TRANSCRIPT_MS = 800;
 let transcriptionSilenceTimer = null;
 let lateTranscriptionTimer = null;
@@ -170,13 +250,24 @@ let whisperSpeechFrames = 0;
 let whisperSilenceFrames = 0;
 let whisperAudioBuffer = []; // Buffers during active speech
 let whisperPreBuffer = []; // Rolling pre-speech buffer (last N frames)
+let whisperAudioBytes = 0;
+let whisperJobs = [];
+let whisperJobActive = false;
+let whisperJobGeneration = 0;
+let previousWhisperTranscript = '';
+const MAX_WHISPER_SEGMENT_BYTES = 16000 * 2 * 20;
+const WHISPER_OVERLAP_BYTES = 16000;
 
 // Reconnection variables
 let isUserClosing = false;
 let sessionParams = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY = 2000;
+let reconnectStartedAt = 0;
+const MAX_RECONNECT_MS = 60000;
+
+function isFatalConnectionClose(event) {
+    return event?.code === 1008 || /auth|api.?key|permission|invalid argument|configuration/i.test(event?.reason || '');
+}
 
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
@@ -200,24 +291,29 @@ function buildContextMessage() {
 // Conversation management functions
 function initializeNewSession(profile = null, customPrompt = null) {
     currentSessionId = Date.now().toString();
+    conversationSequence = 0;
+    screenSequence = 0;
+    transcriptSequence = 0;
     resetLiveConversationBuffers();
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
     lastScreenshotJpeg = null;
     pendingTypedQuestion = null;
+    typedTurnQueue.clear();
+    liveTurnActive = false;
+    currentSummary = '';
+    completedTurnsSinceSummary = 0;
+    lastSummaryAt = 0;
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
+    startSessionArchive({
+        sessionId: currentSessionId,
+        profile,
+        customPrompt: customPrompt || '',
+    }).catch(error => sendToRenderer('update-status', `History error: ${error.message}`));
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
 
-    // Save initial session with profile context
-    if (profile) {
-        sendToRenderer('save-session-context', {
-            sessionId: currentSessionId,
-            profile: profile,
-            customPrompt: customPrompt || '',
-        });
-    }
 }
 
 function saveConversationTurn(transcription, aiResponse) {
@@ -229,20 +325,55 @@ function saveConversationTurn(transcription, aiResponse) {
     pendingTypedQuestion = null;
 
     const conversationTurn = {
+        id: `${currentSessionId}:turn:${++conversationSequence}`,
+        type: 'turn',
         timestamp: Date.now(),
         transcription: userSide,
         ai_response: aiResponse.trim(),
     };
 
     conversationHistory.push(conversationTurn);
+    if (conversationHistory.length > 200) conversationHistory = conversationHistory.slice(-200);
     console.log('Saved conversation turn:', conversationTurn);
 
-    // Send to renderer to save in IndexedDB
-    sendToRenderer('save-conversation-turn', {
-        sessionId: currentSessionId,
-        turn: conversationTurn,
-        fullHistory: conversationHistory,
-    });
+    appendSessionRecord(currentSessionId, conversationTurn).catch(error => sendToRenderer('update-status', `History error: ${error.message}`));
+    completedTurnsSinceSummary++;
+    scheduleMeetingSummary();
+}
+
+function scheduleMeetingSummary() {
+    if (summaryInFlight || completedTurnsSinceSummary < 12 || (lastSummaryAt && Date.now() - lastSummaryAt < 5 * 60 * 1000)) return;
+    const sessionId = currentSessionId;
+    const turns = conversationHistory.slice(-12);
+    const apiKey = getApiKey();
+    if (!sessionId || !apiKey) return;
+    summaryInFlight = true;
+    Promise.resolve()
+        .then(async () => {
+            const ai = new GoogleGenAI({ apiKey });
+            const prompt = `Update the structured meeting summary. Keep decisions, constraints, names, unresolved questions, and supporting turn IDs. Return concise plain text.\n\nPrevious summary:\n${currentSummary}\n\nNew turns:\n${JSON.stringify(turns)}`;
+            const response = await ai.models.generateContent({
+                model: 'gemini-3.1-flash-lite',
+                contents: prompt,
+                config: { maxOutputTokens: 1000, thinkingConfig: { thinkingBudget: 0 } },
+            });
+            const summary = String(response.text || '').trim();
+            if (!summary || sessionId !== currentSessionId) return;
+            currentSummary = summary;
+            completedTurnsSinceSummary = 0;
+            lastSummaryAt = Date.now();
+            await appendSessionRecord(sessionId, {
+                id: `${sessionId}:summary:${lastSummaryAt}`,
+                type: 'summary',
+                timestamp: lastSummaryAt,
+                summary,
+                supportingTurnIds: turns.map(turn => turn.id),
+            });
+        })
+        .catch(error => console.warn('Background meeting summary failed:', error.message))
+        .finally(() => {
+            summaryInFlight = false;
+        });
 }
 
 function saveScreenAnalysis(prompt, response, model) {
@@ -251,6 +382,8 @@ function saveScreenAnalysis(prompt, response, model) {
     }
 
     const analysisEntry = {
+        id: `${currentSessionId}:screen:${++screenSequence}`,
+        type: 'screen',
         timestamp: Date.now(),
         prompt: prompt,
         response: response.trim(),
@@ -258,16 +391,10 @@ function saveScreenAnalysis(prompt, response, model) {
     };
 
     screenAnalysisHistory.push(analysisEntry);
+    if (screenAnalysisHistory.length > 100) screenAnalysisHistory = screenAnalysisHistory.slice(-100);
     console.log('Saved screen analysis:', analysisEntry);
 
-    // Send to renderer to save
-    sendToRenderer('save-screen-analysis', {
-        sessionId: currentSessionId,
-        analysis: analysisEntry,
-        fullHistory: screenAnalysisHistory,
-        profile: currentProfile,
-        customPrompt: currentCustomPrompt,
-    });
+    appendSessionRecord(currentSessionId, analysisEntry).catch(error => sendToRenderer('update-status', `History error: ${error.message}`));
 }
 
 function getCurrentSessionData() {
@@ -278,28 +405,11 @@ function getCurrentSessionData() {
 }
 
 function buildSessionContextText() {
-    const parts = [];
-    if (conversationHistory.length > 0) {
-        parts.push('Full conversation so far (use every turn, not only the last one):');
-        conversationHistory.forEach((turn, index) => {
-            const n = index + 1;
-            if (turn.transcription?.trim()) {
-                parts.push(`[Turn ${n} user/interviewer]: ${turn.transcription.trim()}`);
-            }
-            if (turn.ai_response?.trim()) {
-                parts.push(`[Turn ${n} assistant]: ${turn.ai_response.trim()}`);
-            }
-        });
-    }
-    if (screenAnalysisHistory.length > 0) {
-        parts.push('Earlier screen analyses in this session:');
-        screenAnalysisHistory.forEach((entry, index) => {
-            if (entry.response?.trim()) {
-                parts.push(`[Screen ${index + 1}]: ${entry.response.trim().slice(0, 2500)}`);
-            }
-        });
-    }
-    return parts.join('\n');
+    return buildRelevantContext({
+        query: pendingTypedQuestion || currentTranscription,
+        summary: currentSummary,
+        records: [...conversationHistory, ...screenAnalysisHistory].sort((a, b) => a.timestamp - b.timestamp),
+    });
 }
 
 function composeUserTurn(text) {
@@ -308,6 +418,30 @@ function composeUserTurn(text) {
         return text;
     }
     return `${context}\n\nCurrent user question (answer using the full conversation and any screen context above):\n${text}`;
+}
+
+async function dispatchLiveTypedTurn(userText) {
+    const session = global.geminiSessionRef?.current;
+    if (!session) return false;
+    pendingTypedQuestion = userText;
+    liveTurnActive = true;
+    try {
+        await attachLastScreenshotToLive(session);
+        await session.sendRealtimeInput({ text: composeUserTurn(userText) });
+        return true;
+    } catch (error) {
+        liveTurnActive = false;
+        pendingTypedQuestion = null;
+        sendToRenderer('update-status', `Could not send message: ${error.message}`);
+        dispatchNextTypedTurn();
+        return false;
+    }
+}
+
+function dispatchNextTypedTurn() {
+    if (liveTurnActive) return;
+    const next = typedTurnQueue.shift();
+    if (next) dispatchLiveTypedTurn(next);
 }
 
 function rememberScreenshot(base64Data) {
@@ -320,7 +454,7 @@ async function attachLastScreenshotToLive(session) {
     if (!session || !lastScreenshotJpeg) return;
     try {
         session.sendRealtimeInput({
-            video: {
+            media: {
                 data: lastScreenshotJpeg,
                 mimeType: 'image/jpeg',
             },
@@ -331,13 +465,25 @@ async function attachLastScreenshotToLive(session) {
 }
 
 async function getEnabledTools() {
-    const tools = [];
-
-    // Check if Google Search is enabled (default: true)
-    const googleSearchEnabled = await getStoredSetting('googleSearchEnabled', 'true');
+    const tools = [
+        {
+            functionDeclarations: [
+                {
+                    name: 'search_meeting',
+                    description: 'Search earlier meeting transcripts and screen analyses for facts relevant to a question.',
+                    parameters: {
+                        type: 'OBJECT',
+                        properties: { query: { type: 'STRING', description: 'The fact or topic to find.' } },
+                        required: ['query'],
+                    },
+                },
+            ],
+        },
+    ];
+    const googleSearchEnabled = getPreferences().googleSearchEnabled === true;
     console.log('Google Search enabled:', googleSearchEnabled);
 
-    if (googleSearchEnabled === 'true') {
+    if (googleSearchEnabled) {
         tools.push({ googleSearch: {} });
         console.log('Added Google Search tool');
     } else {
@@ -345,6 +491,25 @@ async function getEnabledTools() {
     }
 
     return tools;
+}
+
+async function answerMeetingSearchTools(message, session, connectionGeneration) {
+    const calls = message.toolCall?.functionCalls || [];
+    for (const call of calls) {
+        if (call.name !== 'search_meeting' || !liveConnections.isCurrent(connectionGeneration)) continue;
+        let records = [...conversationHistory, ...screenAnalysisHistory];
+        try {
+            const archived = currentSessionId ? await getArchivedSession(currentSessionId) : null;
+            if (archived) records = [...(archived.conversationHistory || []), ...(archived.screenAnalysisHistory || [])];
+        } catch (error) {
+            console.warn('Meeting search used in-memory history:', error.message);
+        }
+        const output = buildRelevantContext({ query: call.args?.query || '', summary: currentSummary, records });
+        if (!liveConnections.isCurrent(connectionGeneration)) return;
+        session.sendToolResponse({
+            functionResponses: [{ id: call.id, name: call.name, response: { output: output || 'No matching meeting context found.' } }],
+        });
+    }
 }
 
 async function getStoredSetting(key, defaultValue) {
@@ -451,6 +616,7 @@ function stripThinkingTags(text) {
 }
 
 async function sendToGroq(transcription) {
+    const answer = createAnswerStream('groq');
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         console.log('No Groq API key configured, skipping Groq response');
@@ -527,7 +693,7 @@ async function sendToGroq(transcription) {
                             fullText += token;
                             const displayText = stripThinkingTags(fullText);
                             if (displayText) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
+                                answer.update(displayText);
                                 isFirst = false;
                             }
                         }
@@ -549,6 +715,7 @@ async function sendToGroq(transcription) {
         incrementCharUsage('groq', modelKey, inputChars + outputChars);
 
         if (cleanedResponse) {
+            answer.complete(cleanedResponse);
             groqConversationHistory.push({
                 role: 'assistant',
                 content: cleanedResponse,
@@ -566,6 +733,7 @@ async function sendToGroq(transcription) {
 }
 
 async function sendToGemma(transcription) {
+    const answer = createAnswerStream('gemma');
     const apiKey = getApiKey();
     if (!apiKey) {
         console.log('No Gemini API key configured');
@@ -613,7 +781,7 @@ async function sendToGemma(transcription) {
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                answer.update(fullText);
                 isFirst = false;
             }
         }
@@ -626,6 +794,7 @@ async function sendToGemma(transcription) {
         incrementCharUsage('gemini', 'gemma-3-27b-it', inputChars + outputChars);
 
         if (fullText.trim()) {
+            answer.complete(fullText.trim());
             groqConversationHistory.push({
                 role: 'assistant',
                 content: fullText.trim(),
@@ -660,7 +829,7 @@ function dispatchTranscription() {
 
 function resetTranscriptionSilenceTimer() {
     clearTranscriptionSilenceTimer();
-    transcriptionSilenceTimer = setTimeout(dispatchTranscription, SILENCE_TIMEOUT_MS);
+    transcriptionSilenceTimer = setTimeout(dispatchTranscription, clientSilenceTimeoutMs());
 }
 
 function clearTranscriptionSilenceTimer() {
@@ -753,13 +922,13 @@ function observeLiveAudioEnergy(pcm16k, session) {
     }
 }
 
-function enqueueLivePcm24k(mono24k, sessionRef) {
+function enqueueLivePcm(monoPcm, sampleRate, sessionRef) {
     const session = sessionRef?.current;
-    if (!session || !mono24k?.length) return;
-    const pcm16k = resampleLive24kTo16k(mono24k);
+    if (!session || !monoPcm?.length) return;
+    const pcm16k = sampleRate === 16000 ? monoPcm : resampleLive24kTo16k(monoPcm);
     if (!pcm16k.length) return;
     observeLiveAudioEnergy(pcm16k, session);
-    geminiAudioQueue.push(pcm16k.toString('base64'));
+    geminiAudioQueue.push({ sequence: geminiAudioSequence++, capturedAt: Date.now(), pcm: pcm16k });
     drainGeminiQueue(sessionRef);
 }
 
@@ -815,11 +984,11 @@ function createWavBuffer(pcmBuffer, sampleRate = 24000) {
     return Buffer.concat([header, pcmBuffer]);
 }
 
-async function transcribeWithGroqWhisper(pcmBuffer) {
+async function transcribeWithGroqWhisper(pcmBuffer, sampleRate = 16000) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) return '';
     try {
-        const wavBuffer = createWavBuffer(pcmBuffer);
+        const wavBuffer = createWavBuffer(pcmBuffer, sampleRate);
         const formData = new FormData();
         formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
         formData.append('model', 'whisper-large-v3-turbo');
@@ -848,9 +1017,38 @@ function resetWhisperVadState() {
     whisperSilenceFrames = 0;
     whisperAudioBuffer = [];
     whisperPreBuffer = [];
+    whisperAudioBytes = 0;
+    whisperJobs = [];
+    whisperJobGeneration++;
+    previousWhisperTranscript = '';
 }
 
-async function processAudioForWhisper(monoChunk) {
+function queueWhisperJob(pcm) {
+    if (whisperJobs.length >= 2) whisperJobs.shift();
+    whisperJobs.push({ pcm, generation: whisperJobGeneration });
+    drainWhisperJobs();
+}
+
+async function drainWhisperJobs() {
+    if (whisperJobActive) return;
+    whisperJobActive = true;
+    while (whisperJobs.length) {
+        const job = whisperJobs.shift();
+        if (job.generation !== whisperJobGeneration) continue;
+        const raw = await transcribeWithGroqWhisper(job.pcm, 16000);
+        const { removeTranscriptOverlap } = require('./transcriptOverlap');
+        const transcription = removeTranscriptOverlap(previousWhisperTranscript, raw);
+        previousWhisperTranscript = raw || previousWhisperTranscript;
+        if (!transcription.trim()) continue;
+        if (needsVisualContext(transcription)) sendToRenderer('auto-capture-screenshot', { transcription });
+        else sendToGroq(transcription);
+    }
+    whisperJobActive = false;
+    sendToRenderer('update-status', 'Listening...');
+}
+
+async function processAudioForWhisper(monoChunk, sampleRate = 24000) {
+    if (sampleRate !== 16000) monoChunk = resampleLive24kTo16k(monoChunk);
     // Calculate RMS energy of this chunk
     let sum = 0;
     for (let i = 0; i < monoChunk.length - 1; i += 2) {
@@ -873,6 +1071,7 @@ async function processAudioForWhisper(monoChunk) {
             whisperIsSpeaking = true;
             // Include pre-buffer frames so we don't cut off utterance start
             whisperAudioBuffer = [...whisperPreBuffer];
+            whisperAudioBytes = whisperAudioBuffer.reduce((sum, frame) => sum + frame.length, 0);
             sendToRenderer('update-status', 'Transcribing...');
         }
     } else {
@@ -881,26 +1080,28 @@ async function processAudioForWhisper(monoChunk) {
     }
 
     if (whisperIsSpeaking) {
-        if (isSpeech) whisperAudioBuffer.push(monoChunk);
+        if (isSpeech) {
+            whisperAudioBuffer.push(monoChunk);
+            whisperAudioBytes += monoChunk.length;
+            if (whisperAudioBytes >= MAX_WHISPER_SEGMENT_BYTES) {
+                const combined = Buffer.concat(whisperAudioBuffer);
+                queueWhisperJob(combined.subarray(0, MAX_WHISPER_SEGMENT_BYTES));
+                const overlap = combined.subarray(Math.max(0, MAX_WHISPER_SEGMENT_BYTES - WHISPER_OVERLAP_BYTES));
+                whisperAudioBuffer = [Buffer.from(overlap)];
+                whisperAudioBytes = overlap.length;
+            }
+        }
 
         if (!isSpeech && whisperSilenceFrames >= WHISPER_SILENCE_END_FRAMES) {
             // End of utterance — send to Whisper
             whisperIsSpeaking = false;
             const utterancePcm = Buffer.concat(whisperAudioBuffer);
             whisperAudioBuffer = [];
+            whisperAudioBytes = 0;
             whisperSpeechFrames = 0;
             whisperSilenceFrames = 0;
 
-            const transcription = await transcribeWithGroqWhisper(utterancePcm);
-            if (transcription.trim()) {
-                if (needsVisualContext(transcription)) {
-                    console.log('[auto-screenshot] Visual context detected:', transcription.substring(0, 60));
-                    sendToRenderer('auto-capture-screenshot', { transcription });
-                } else {
-                    sendToGroq(transcription);
-                }
-            }
-            sendToRenderer('update-status', 'Listening...');
+            queueWhisperJob(utterancePcm);
         }
     }
 }
@@ -912,6 +1113,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     }
 
     isInitializingSession = true;
+    isUserClosing = false;
+    const connectionGeneration = liveConnections.begin();
+    let liveSession = null;
     if (!isReconnect) {
         sendToRenderer('session-initializing', true);
     }
@@ -928,11 +1132,6 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         pendingLiveImage = null;
     }
 
-    const client = new GoogleGenAI({
-        vertexai: false,
-        apiKey: apiKey,
-    });
-
     // Get enabled tools first to determine Google Search status
     const enabledTools = await getEnabledTools();
     const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
@@ -947,21 +1146,36 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
     try {
         console.log(`Connecting Gemini Live: ${GEMINI_LIVE_MODEL}`);
-        const session = await client.live.connect({
+        liveSession = await connectGeminiLive({
+            apiKey,
             model: GEMINI_LIVE_MODEL,
             callbacks: {
                 onopen: function () {
+                    if (!liveConnections.isCurrent(connectionGeneration)) return;
                     sendToRenderer('update-status', 'Live session connected');
                 },
                 onmessage: function (message) {
+                    if (!liveConnections.isCurrent(connectionGeneration)) return;
                     if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
                         sessionResumptionHandle = message.sessionResumptionUpdate.newHandle;
                     }
+                    if (message.sessionResumptionUpdate && message.sessionResumptionUpdate.resumable === false && sessionResumptionHandle) {
+                        console.warn('Gemini rejected session resumption; reconnecting once with bounded saved context');
+                        sessionResumptionHandle = null;
+                        liveSession?.close();
+                        return;
+                    }
+
+                    answerMeetingSearchTools(message, liveSession, connectionGeneration).catch(error =>
+                        console.warn('Meeting search tool failed:', error.message)
+                    );
 
                     if (message.goAway && !isUserClosing) {
                         console.log('Live GoAway received, reconnecting with resumption handle');
                         reconnectAttempts = 0;
-                        attemptReconnect({ immediate: true });
+                        attemptReconnect({ immediate: true }).then(success => {
+                            if (success) liveSession?.close();
+                        });
                         return;
                     }
 
@@ -973,11 +1187,19 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
                 },
                 onerror: function (e) {
+                    if (!liveConnections.isCurrent(connectionGeneration)) return;
                     console.log('Session error:', e.message);
                     sendToRenderer('update-status', 'Error: ' + e.message);
                 },
                 onclose: function (e) {
+                    if (!liveConnections.isCurrent(connectionGeneration)) return;
                     console.log('Session closed:', e.reason);
+
+                    if (isFatalConnectionClose(e)) {
+                        sessionParams = null;
+                        sendToRenderer('update-status', `Gemini configuration error: ${e.reason || 'authentication failed'}`);
+                        return;
+                    }
 
                     // Don't reconnect if user intentionally closed
                     if (isUserClosing) {
@@ -987,7 +1209,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
 
                     // Attempt reconnection
-                    if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    if (sessionParams) {
                         attemptReconnect();
                     } else {
                         sendToRenderer('update-status', 'Session closed');
@@ -995,9 +1217,12 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 },
             },
             config: {
-                responseModalities: [Modality.AUDIO],
-                thinkingConfig: { thinkingLevel: 'MINIMAL' },
-                mediaResolution: 'MEDIA_RESOLUTION_MEDIUM',
+                generationConfig: {
+                    responseModalities: ['AUDIO'],
+                    thinkingConfig: { thinkingLevel: 'MINIMAL' },
+                    mediaResolution: 'MEDIA_RESOLUTION_MEDIUM',
+                    speechConfig: { languageCode: language },
+                },
                 sessionResumption: sessionResumptionHandle ? { handle: sessionResumptionHandle } : {},
                 outputAudioTranscription: {
                     languageCodes: language ? [language] : ['en-US'],
@@ -1012,7 +1237,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
                         endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
                         prefixPaddingMs: 300,
-                        silenceDurationMs: 2000,
+                        silenceDurationMs: getPreferences().vadPreset === 'patient' ? 1200 : 800,
                     },
                     turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY',
                 },
@@ -1020,18 +1245,22 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     triggerTokens: '20000',
                     slidingWindow: { targetTokens: '8000' },
                 },
-                speechConfig: { languageCode: language },
                 systemInstruction: {
                     parts: [{ text: systemPrompt }],
                 },
             },
         });
 
+        if (!liveConnections.isCurrent(connectionGeneration)) {
+            liveSession.close();
+            isInitializingSession = false;
+            return null;
+        }
         isInitializingSession = false;
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
         }
-        return session;
+        return liveSession;
     } catch (error) {
         console.error('Failed to initialize Gemini session:', error);
         isInitializingSession = false;
@@ -1046,9 +1275,10 @@ async function attemptReconnect(options = {}) {
     if (isUserClosing || !sessionParams) return false;
     if (reconnectInFlight) return false;
     reconnectInFlight = true;
+    if (!reconnectStartedAt) reconnectStartedAt = Date.now();
 
     reconnectAttempts++;
-    console.log(`Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+    console.log(`Reconnection attempt ${reconnectAttempts}`);
 
     resetLiveConversationBuffers();
     resetWhisperVadState();
@@ -1057,10 +1287,14 @@ async function attemptReconnect(options = {}) {
     liveSilenceMs = 0;
     liveAudioStreamEndSent = false;
 
-    sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    sendToRenderer('update-status', `Reconnecting... (attempt ${reconnectAttempts})`);
 
     if (!options.immediate) {
-        await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+        await new Promise(resolve => setTimeout(resolve, liveConnections.retryDelay(reconnectAttempts - 1)));
+        if (isUserClosing || !sessionParams) {
+            reconnectInFlight = false;
+            return false;
+        }
     }
 
     try {
@@ -1088,6 +1322,7 @@ async function attemptReconnect(options = {}) {
             }
 
             reconnectAttempts = 0;
+            reconnectStartedAt = 0;
             sendToRenderer('update-status', 'Reconnected! Listening...');
             console.log('Session reconnected successfully');
             reconnectInFlight = false;
@@ -1100,14 +1335,14 @@ async function attemptReconnect(options = {}) {
     reconnectInFlight = false;
 
     // If we still have attempts left, try again
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    if (Date.now() - reconnectStartedAt < MAX_RECONNECT_MS) {
         return attemptReconnect();
     }
 
     // Max attempts reached - notify frontend
     console.log('Max reconnection attempts reached');
     sendToRenderer('reconnect-failed', {
-        message: 'Tried 3 times to reconnect. Must be upstream/network issues. Try restarting or download updated app from site.',
+        message: 'Could not reconnect for 60 seconds. Check the network or restart the meeting.',
     });
     sessionParams = null;
     return false;
@@ -1202,7 +1437,7 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             } else if (currentProviderMode === 'local') {
                 getLocalAi().processLocalAudio(monoChunk);
             } else if (geminiSessionRef.current) {
-                enqueueLivePcm24k(monoChunk, geminiSessionRef);
+                enqueueLivePcm(monoChunk, 24000, geminiSessionRef);
             } else if (canUseGroqFallback()) {
                 processAudioForWhisper(monoChunk);
             }
@@ -1256,8 +1491,12 @@ function stopMacOSAudioCapture() {
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
-    geminiAudioQueue = [];
+    geminiAudioQueue.clear();
+    geminiAudioSequence = 0;
     geminiSendLock = false;
+    congestionStartedAt = 0;
+    if (congestionRetryTimer) clearTimeout(congestionRetryTimer);
+    congestionRetryTimer = null;
     resetWhisperVadState();
 }
 
@@ -1265,8 +1504,28 @@ async function drainGeminiQueue(geminiSessionRef) {
     if (geminiSendLock) return;
     geminiSendLock = true;
     while (geminiAudioQueue.length > 0) {
-        const base64Data = geminiAudioQueue.shift();
-        await sendAudioToGemini(base64Data, geminiSessionRef);
+        const session = geminiSessionRef.current;
+        if (!session) break;
+        if ((session.bufferedBytes || 0) > 64000) {
+            if (!congestionStartedAt) congestionStartedAt = Date.now();
+            geminiSendLock = false;
+            if (Date.now() - congestionStartedAt > 2000) {
+                console.warn('Gemini Live congestion exceeded the audio budget; reconnecting');
+                session.close();
+                congestionStartedAt = 0;
+                return;
+            }
+            if (!congestionRetryTimer) {
+                congestionRetryTimer = setTimeout(() => {
+                    congestionRetryTimer = null;
+                    drainGeminiQueue(geminiSessionRef);
+                }, 40);
+            }
+            return;
+        }
+        congestionStartedAt = 0;
+        const frame = geminiAudioQueue.shift();
+        await sendAudioToGemini(frame.pcm.toString('base64'), geminiSessionRef);
     }
     geminiSendLock = false;
     if (geminiSessionRef.current && pendingLiveImage) {
@@ -1290,6 +1549,7 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
 }
 
 async function sendImageToGroqLlama4(base64Data, prompt) {
+    const answer = createAnswerStream('screen-groq');
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         return { success: false, error: 'No Groq API key configured' };
@@ -1351,7 +1611,7 @@ async function sendImageToGroqLlama4(base64Data, prompt) {
                     const delta = chunk.choices?.[0]?.delta?.content;
                     if (delta) {
                         fullText += delta;
-                        sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                        answer.update(fullText);
                         isFirst = false;
                     }
                 } catch (_) {}
@@ -1361,6 +1621,7 @@ async function sendImageToGroqLlama4(base64Data, prompt) {
         console.log(`Image response completed from ${model}`);
 
         if (fullText.trim()) {
+            answer.complete(fullText.trim());
             groqConversationHistory.push({
                 role: 'user',
                 content: `[Screen context]: ${fullText.trim()}`,
@@ -1379,6 +1640,7 @@ async function sendImageToGroqLlama4(base64Data, prompt) {
 }
 
 async function sendImageToGeminiHttp(base64Data, prompt) {
+    const answer = createAnswerStream('screen-gemini');
     // Get available model based on rate limits
     const model = getAvailableModel();
 
@@ -1417,7 +1679,7 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
             if (chunkText) {
                 fullText += chunkText;
                 // Send to renderer - new response for first chunk, update for subsequent
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                answer.update(fullText);
                 isFirst = false;
             }
         }
@@ -1427,6 +1689,7 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         if (!fullText.trim()) {
             return { success: false, error: 'Screen analysis returned no text' };
         }
+        answer.complete(fullText.trim());
 
         // Inject screen analysis into Groq context for follow-up voice questions
         if (fullText.trim()) {
@@ -1447,6 +1710,25 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         console.error('Error sending image to Gemini HTTP:', error);
         return { success: false, error: error.message };
     }
+}
+
+function routeAudioFrame(pcmBuffer, sampleRate, geminiSessionRef) {
+    if (currentProviderMode === 'cloud') {
+        return { success: sendCloudAudio(pcmBuffer), provider: 'cloud' };
+    }
+    if (currentProviderMode === 'local') {
+        getLocalAi().processLocalAudio(pcmBuffer, sampleRate);
+        return { success: true, provider: 'local' };
+    }
+    if (geminiSessionRef.current) {
+        enqueueLivePcm(pcmBuffer, sampleRate, geminiSessionRef);
+        return { success: true, provider: 'gemini' };
+    }
+    if (canUseGroqFallback()) {
+        processAudioForWhisper(pcmBuffer, sampleRate);
+        return { success: true, provider: 'groq' };
+    }
+    return { success: false, error: 'No active AI session' };
 }
 
 function setupGeminiIpcHandlers(geminiSessionRef) {
@@ -1493,6 +1775,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         return success;
     });
 
+    ipcMain.handle('send-audio-frame', async (event, payload) => {
+        try {
+            const frame = validateAudioFrame(payload);
+            const result = routeAudioFrame(frame.pcm, frame.sampleRate, geminiSessionRef);
+            return { ...result, queuedMs: geminiAudioQueue.durationMs };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    });
+
     ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
         if (currentProviderMode === 'cloud') {
             try {
@@ -1515,7 +1807,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
         }
         if (geminiSessionRef.current) {
-            enqueueLivePcm24k(Buffer.from(data, 'base64'), geminiSessionRef);
+            enqueueLivePcm(Buffer.from(data, 'base64'), 24000, geminiSessionRef);
             return { success: true };
         }
         if (canUseGroqFallback()) {
@@ -1549,7 +1841,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
         }
         if (geminiSessionRef.current) {
-            enqueueLivePcm24k(Buffer.from(data, 'base64'), geminiSessionRef);
+            enqueueLivePcm(Buffer.from(data, 'base64'), 24000, geminiSessionRef);
             return { success: true };
         }
         if (canUseGroqFallback()) {
@@ -1643,11 +1935,11 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
 
         const userText = text.trim();
-        pendingTypedQuestion = userText;
-        const contextualText = composeUserTurn(userText);
 
         if (currentProviderMode === 'cloud') {
             try {
+                pendingTypedQuestion = userText;
+                const contextualText = composeUserTurn(userText);
                 console.log('Sending text to cloud with full session context');
                 if (lastScreenshotJpeg) {
                     sendCloudImage(lastScreenshotJpeg);
@@ -1665,6 +1957,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
         if (currentProviderMode === 'local') {
             try {
+                pendingTypedQuestion = userText;
+                const contextualText = composeUserTurn(userText);
                 console.log('Sending text to local Ollama with session context');
                 if (lastScreenshotJpeg) {
                     return await getLocalAi().sendLocalImage(lastScreenshotJpeg, contextualText);
@@ -1677,21 +1971,22 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
 
         if (!geminiSessionRef.current && canUseGroqFallback()) {
+            pendingTypedQuestion = userText;
+            const contextualText = composeUserTurn(userText);
             sendToGroq(contextualText);
             return { success: true };
         }
 
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
 
-        try {
-            console.log('Sending text to Gemini Live with full session context');
-            await attachLastScreenshotToLive(geminiSessionRef.current);
-            await geminiSessionRef.current.sendRealtimeInput({ text: contextualText });
-            return { success: true };
-        } catch (error) {
-            console.error('Error sending text:', error);
-            return { success: false, error: error.message };
+        if (liveTurnActive) {
+            const queued = typedTurnQueue.push(userText);
+            return queued.accepted
+                ? { success: true, queued: true, queueSize: typedTurnQueue.length }
+                : { success: false, queueFull: true, error: 'Three typed questions are already waiting.' };
         }
+        const sent = await dispatchLiveTypedTurn(userText);
+        return sent ? { success: true } : { success: false, error: 'Could not send the message' };
     });
 
     ipcMain.handle('start-macos-audio', async event => {
@@ -1724,6 +2019,15 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('close-session', async event => {
         try {
             stopMacOSAudioCapture();
+            if (liveOutputText.trim()) {
+                if (!liveTurnId) liveTurnId = createTurnId('live');
+                emitAnswer(sendToRenderer, liveTurnId, 'interrupted', liveOutputText.trim(), liveOutputSequence++);
+                saveConversationTurn(currentTranscription.trim() || '(interrupted audio)', liveOutputText.trim());
+            }
+            if (currentSessionId) await flushSessionArchive(currentSessionId);
+            typedTurnQueue.clear();
+            liveTurnActive = false;
+            resetLiveConversationBuffers();
 
             if (currentProviderMode === 'cloud') {
                 closeCloud();
@@ -1738,7 +2042,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
 
             isUserClosing = true;
+            liveConnections.stop();
             sessionParams = null;
+            reconnectStartedAt = 0;
+            reconnectInFlight = false;
             sessionResumptionHandle = null;
             pendingLiveImage = null;
             clearTranscriptionSilenceTimer();
@@ -1781,8 +2088,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('update-google-search-setting', async (event, enabled) => {
         try {
             console.log('Google Search setting updated to:', enabled);
-            // The setting is already saved in localStorage by the renderer
-            // This is just for logging/confirmation
+            if (sessionParams && global.geminiSessionRef?.current) {
+                sessionResumptionHandle = null;
+                global.geminiSessionRef.current.close();
+            }
             return { success: true };
         } catch (error) {
             console.error('Error updating Google Search setting:', error);
