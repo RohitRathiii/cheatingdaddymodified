@@ -233,7 +233,12 @@ export class CustomizeView extends LitElement {
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
-                this.keybinds = { ...this.getDefaultKeybinds(), ...keybinds };
+                const defaults = this.getDefaultKeybinds();
+                this.keybinds = { ...defaults, ...keybinds };
+                const isMac = cheatingDaddy.isMacOS || navigator.platform.includes('Mac');
+                if (!isMac && this.keybinds.toggleVisibility === 'Ctrl+\\') {
+                    this.keybinds = { ...this.keybinds, toggleVisibility: 'Alt' };
+                }
             }
             this.updateBackgroundAppearance();
             this.updateFontSize();
@@ -297,7 +302,7 @@ export class CustomizeView extends LitElement {
             moveDown: isMac ? 'Alt+Down' : 'Ctrl+Down',
             moveLeft: isMac ? 'Alt+Left' : 'Ctrl+Left',
             moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
-            toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
+            toggleVisibility: isMac ? 'Cmd+\\' : 'Alt',
             toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
             nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
             previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
@@ -316,7 +321,7 @@ export class CustomizeView extends LitElement {
             {
                 key: 'toggleVisibility',
                 name: 'Toggle Visibility',
-                description: 'Show or hide the app window. On Mac, tap Option by itself to hide with click-through; tap Option again to restore.',
+                description: 'Show or hide the app window. Tap Option on Mac or Alt on Windows by itself to hide; tap it again to restore.',
             },
             { key: 'toggleClickThrough', name: 'Toggle Click-through', description: 'Enable or disable click-through mode' },
             { key: 'nextStep', name: 'Ask Next Step', description: 'Take screenshot and ask for next step' },
@@ -457,7 +462,14 @@ export class CustomizeView extends LitElement {
                 break;
         }
 
-        if (['Control', 'Meta', 'Alt', 'Shift'].includes(e.key)) return;
+        if (['Control', 'Meta', 'Alt', 'Shift'].includes(e.key)) {
+            if (e.key === 'Alt' && e.target.dataset.action === 'toggleVisibility') {
+                this.handleKeybindChange('toggleVisibility', 'Alt');
+                e.target.value = 'Alt';
+                e.target.blur();
+            }
+            return;
+        }
 
         const action = e.target.dataset.action;
         const keybind = [...modifiers, mainKey].join('+');

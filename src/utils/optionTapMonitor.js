@@ -1,6 +1,7 @@
 const { systemPreferences } = require('electron');
+const { isAltKeyEvent, isAltUsedAsChord, shouldToggleOnAltRelease } = require('./overlayVisibility');
 
-const ALT_KEYCODES = new Set([56, 3640]);
+const STARTUP_IGNORE_MS = 400;
 
 let hookApi = null;
 let hookLoadAttempted = false;
@@ -9,6 +10,7 @@ let promptedAccessibility = false;
 let optionHeld = false;
 let usedAsModifier = false;
 let onOptionTap = null;
+let ignoreUntil = 0;
 
 function loadHook() {
     if (hookLoadAttempted) return hookApi;
@@ -22,15 +24,11 @@ function loadHook() {
     return hookApi;
 }
 
-function isAltKey(event) {
-    return Boolean(event && ALT_KEYCODES.has(event.keycode));
-}
-
 function handleKeyDown(event) {
-    if (isAltKey(event)) {
+    if (isAltKeyEvent(event)) {
         if (!optionHeld) {
             optionHeld = true;
-            usedAsModifier = false;
+            usedAsModifier = isAltUsedAsChord(event);
         }
         return;
     }
@@ -40,8 +38,13 @@ function handleKeyDown(event) {
 }
 
 function handleKeyUp(event) {
-    if (!isAltKey(event)) return;
-    const shouldToggle = optionHeld && !usedAsModifier;
+    if (!isAltKeyEvent(event)) return;
+    const shouldToggle = shouldToggleOnAltRelease({
+        optionHeld,
+        usedAsModifier,
+        now: Date.now(),
+        ignoreUntil,
+    });
     optionHeld = false;
     usedAsModifier = false;
     if (shouldToggle && typeof onOptionTap === 'function') {
@@ -69,6 +72,9 @@ function ensureAccessibility() {
 
 function startOptionTapMonitor(callback) {
     onOptionTap = callback;
+    optionHeld = false;
+    usedAsModifier = false;
+    ignoreUntil = Date.now() + STARTUP_IGNORE_MS;
 
     const api = loadHook();
     if (!api || !api.uIOhook) return false;
@@ -83,7 +89,7 @@ function startOptionTapMonitor(callback) {
         hookStarted = true;
         return true;
     } catch (error) {
-        console.warn('Failed to start Option tap monitor:', error.message);
+        console.warn('Failed to start Alt tap monitor:', error.message);
         hookStarted = false;
         return false;
     }

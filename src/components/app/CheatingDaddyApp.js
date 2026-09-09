@@ -496,17 +496,20 @@ export class CheatingDaddyApp extends LitElement {
 
         this._optionHeld = false;
         this._optionUsedAsModifier = false;
+        this._isAltEvent = event => event.key === 'Alt' || event.code === 'AltLeft' || event.code === 'AltRight';
         this._onOptionKeyDown = event => {
             if (event.repeat) return;
-            if (event.key === 'Alt') {
+            if (this._isAltEvent(event)) {
+                event.preventDefault();
                 this._optionHeld = true;
-                this._optionUsedAsModifier = false;
+                this._optionUsedAsModifier = event.ctrlKey || event.metaKey || event.shiftKey;
                 return;
             }
             if (this._optionHeld) this._optionUsedAsModifier = true;
         };
         this._onOptionKeyUp = event => {
-            if (event.key !== 'Alt') return;
+            if (!this._isAltEvent(event)) return;
+            event.preventDefault();
             const tap = this._optionHeld && !this._optionUsedAsModifier;
             this._optionHeld = false;
             this._optionUsedAsModifier = false;

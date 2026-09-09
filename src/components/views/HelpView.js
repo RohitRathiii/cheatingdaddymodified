@@ -110,6 +110,10 @@ export class HelpView extends LitElement {
             const keybinds = await cheatingDaddy.storage.getKeybinds();
             if (keybinds) {
                 this.keybinds = { ...this.getDefaultKeybinds(), ...keybinds };
+                const isMac = cheatingDaddy.isMacOS || navigator.platform.includes('Mac');
+                if (!isMac && this.keybinds.toggleVisibility === 'Ctrl+\\') {
+                    this.keybinds = { ...this.keybinds, toggleVisibility: 'Alt' };
+                }
                 this.requestUpdate();
             }
         } catch (error) {
@@ -124,7 +128,7 @@ export class HelpView extends LitElement {
             moveDown: isMac ? 'Alt+Down' : 'Ctrl+Down',
             moveLeft: isMac ? 'Alt+Left' : 'Ctrl+Left',
             moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
-            toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
+            toggleVisibility: isMac ? 'Cmd+\\' : 'Alt',
             toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
             nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
             previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
@@ -189,8 +193,8 @@ export class HelpView extends LitElement {
                         <div class="surface-title">Hide overlay</div>
                         <div class="list">
                             <div class="list-item">
-                                Tap Option (Alt on Windows) by itself to hide the overlay and let clicks pass through to the app below. Tap Option
-                                again to bring it back. Option used with another key is left alone. Toggle Visibility still works.
+                                Tap Option on Mac or Alt on Windows by itself to hide the overlay and let clicks pass through to the app below. Tap
+                                the same key again to bring it back. Using it with another key is left alone. Ctrl+\\ remains a Windows fallback.
                             </div>
                         </div>
                     </section>

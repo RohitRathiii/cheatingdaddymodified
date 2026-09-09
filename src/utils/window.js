@@ -1,7 +1,8 @@
-const { BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
+const { BrowserWindow, globalShortcut, ipcMain, screen, Menu } = require('electron');
 const path = require('node:path');
 const storage = require('../storage');
 const { startOptionTapMonitor, stopOptionTapMonitor } = require('./optionTapMonitor');
+const { canRegisterGlobalShortcut, getDefaultToggleVisibility, mergeKeybinds, getOverlayRestoreMethod } = require('./overlayVisibility');
 
 let mouseEventsIgnored = false;
 let stealthHidden = false;
@@ -30,14 +31,54 @@ function hideOverlayWindow(mainWindow) {
     mainWindow.hide();
 }
 
+function restoreOverlayWindow(mainWindow) {
+    if (getOverlayRestoreMethod(process.platform) === 'show') {
+        try {
+            mainWindow.setOpacity(1);
+        } catch (error) {
+            // ignore
+        }
+        mainWindow.show();
+        mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+        if (typeof mainWindow.moveTop === 'function') {
+            mainWindow.moveTop();
+        }
+        return;
+    }
+    mainWindow.showInactive();
+}
+
 function showOverlayWindow(mainWindow) {
     stealthHidden = false;
     if (!mainWindow || mainWindow.isDestroyed()) return;
     setClickThrough(mainWindow, false);
     if (!mainWindow.isVisible()) {
-        mainWindow.showInactive();
+        restoreOverlayWindow(mainWindow);
     }
     mainWindow.webContents.send('stealth-hidden-changed', false);
+}
+
+function setWindowFrame(mainWindow, width, height, x, y) {
+    const wasResizable = mainWindow.isResizable();
+    if (!wasResizable) {
+        mainWindow.setResizable(true);
+    }
+    mainWindow.setSize(width, height);
+    mainWindow.setPosition(x, y);
+    if (!wasResizable) {
+        mainWindow.setResizable(false);
+    }
+}
+
+function getTopCenteredBounds(width, height) {
+    const primaryDisplay = screen.getPrimaryDisplay();
+    const workArea = primaryDisplay.workArea || { x: 0, y: 0, ...primaryDisplay.workAreaSize };
+    return {
+        x: workArea.x + Math.floor((workArea.width - width) / 2),
+        y: workArea.y,
+        width,
+        height,
+    };
 }
 
 function toggleOverlayVisibility(mainWindow) {
@@ -53,17 +94,32 @@ function toggleOverlayVisibility(mainWindow) {
 }
 
 function createWindow(sendToRenderer, geminiSessionRef) {
-    // Get layout preference (default to 'normal')
-    let windowWidth = 1100;
-    let windowHeight = 800;
+    const isWin = process.platform === 'win32';
+    const windowWidth = 1100;
+    const windowHeight = 800;
+    const startBounds = getTopCenteredBounds(windowWidth, windowHeight);
+
+    if (isWin) {
+        try {
+            Menu.setApplicationMenu(null);
+        } catch (error) {
+            console.warn('Could not remove application menu:', error.message);
+        }
+    }
 
     const mainWindow = new BrowserWindow({
-        width: windowWidth,
-        height: windowHeight,
+        width: startBounds.width,
+        height: startBounds.height,
+        x: startBounds.x,
+        y: startBounds.y,
+        show: false,
         frame: false,
         transparent: true,
         hasShadow: false,
         alwaysOnTop: true,
+        skipTaskbar: isWin,
+        roundedCorners: !isWin,
+        autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false, // TODO: change to true
@@ -72,7 +128,7 @@ function createWindow(sendToRenderer, geminiSessionRef) {
             webSecurity: true,
             allowRunningInsecureContent: false,
         },
-        backgroundColor: '#00000000',
+        backgroundColor: isWin ? '#01000000' : '#00000000',
     });
 
     const { session, desktopCapturer } = require('electron');
@@ -86,64 +142,78 @@ function createWindow(sendToRenderer, geminiSessionRef) {
     );
 
     mainWindow.setResizable(false);
-    mainWindow.setContentProtection(true);
     mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
-    // Hide from Windows taskbar
-    if (process.platform === 'win32') {
-        try {
-            mainWindow.setSkipTaskbar(true);
-        } catch (error) {
-            console.warn('Could not hide from taskbar:', error.message);
-        }
-    }
-
-    // Hide from Mission Control on macOS
     if (process.platform === 'darwin') {
         try {
             mainWindow.setHiddenInMissionControl(true);
         } catch (error) {
             console.warn('Could not hide from Mission Control:', error.message);
         }
+        mainWindow.setContentProtection(true);
     }
 
-    // Center window at the top of the screen
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width: screenWidth } = primaryDisplay.workAreaSize;
-    const x = Math.floor((screenWidth - windowWidth) / 2);
-    const y = 0;
-    mainWindow.setPosition(x, y);
-
-    if (process.platform === 'win32') {
+    if (isWin) {
         mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
     }
 
+    let overlayReady = false;
+    const revealOverlay = () => {
+        if (overlayReady || mainWindow.isDestroyed()) return;
+        overlayReady = true;
+
+        if (isWin) {
+            try {
+                mainWindow.setOpacity(1);
+            } catch (error) {
+                // ignore
+            }
+            mainWindow.setContentProtection(true);
+            try {
+                mainWindow.setSkipTaskbar(true);
+            } catch (error) {
+                console.warn('Could not hide from taskbar:', error.message);
+            }
+            mainWindow.show();
+            mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+            if (typeof mainWindow.moveTop === 'function') {
+                mainWindow.moveTop();
+            }
+        } else {
+            mainWindow.show();
+        }
+
+        const optionMonitorReady = startOptionTapMonitor(() => {
+            toggleOverlayVisibility(mainWindow);
+        });
+        if (!optionMonitorReady) {
+            console.warn(
+                isWin
+                    ? 'Alt tap hide is unavailable; Ctrl+\\ still toggles visibility.'
+                    : 'Option tap hide requires Accessibility on macOS; Cmd+\\ still toggles visibility.'
+            );
+        }
+    };
+
+    mainWindow.once('ready-to-show', revealOverlay);
+    // Transparent Windows windows sometimes never emit ready-to-show.
+    setTimeout(revealOverlay, isWin ? 400 : 2000);
+
     mainWindow.loadFile(path.join(__dirname, '../index.html'));
 
-    // After window is created, initialize keybinds
     mainWindow.webContents.once('dom-ready', () => {
         setTimeout(() => {
             const defaultKeybinds = getDefaultKeybinds();
-            let keybinds = defaultKeybinds;
-
-            // Load keybinds from storage
             const savedKeybinds = storage.getKeybinds();
-            if (savedKeybinds) {
-                keybinds = { ...defaultKeybinds, ...savedKeybinds };
+            const keybinds = mergeKeybinds(defaultKeybinds, savedKeybinds, process.platform);
+            if (process.platform === 'win32' && savedKeybinds && savedKeybinds.toggleVisibility === 'Ctrl+\\') {
+                storage.setKeybinds(keybinds);
             }
-
             updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessionRef);
         }, 150);
     });
 
     setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef);
-
-    const optionMonitorReady = startOptionTapMonitor(() => {
-        toggleOverlayVisibility(mainWindow);
-    });
-    if (!optionMonitorReady) {
-        console.warn('Option tap hide requires Accessibility on macOS; Cmd+\\ still toggles visibility.');
-    }
 
     return mainWindow;
 }
@@ -155,7 +225,7 @@ function getDefaultKeybinds() {
         moveDown: isMac ? 'Alt+Down' : 'Ctrl+Down',
         moveLeft: isMac ? 'Alt+Left' : 'Ctrl+Left',
         moveRight: isMac ? 'Alt+Right' : 'Ctrl+Right',
-        toggleVisibility: isMac ? 'Cmd+\\' : 'Ctrl+\\',
+        toggleVisibility: getDefaultToggleVisibility(process.platform),
         toggleClickThrough: isMac ? 'Cmd+M' : 'Ctrl+M',
         nextStep: isMac ? 'Cmd+Enter' : 'Ctrl+Enter',
         previousResponse: isMac ? 'Cmd+[' : 'Ctrl+[',
@@ -213,8 +283,8 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
         }
     });
 
-    // Register toggle visibility shortcut
-    if (keybinds.toggleVisibility) {
+    // Register toggle visibility shortcut. Electron cannot register Alt by itself.
+    if (canRegisterGlobalShortcut(keybinds.toggleVisibility)) {
         try {
             globalShortcut.register(keybinds.toggleVisibility, () => {
                 toggleOverlayVisibility(mainWindow);
@@ -222,6 +292,19 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             console.log(`Registered toggleVisibility: ${keybinds.toggleVisibility}`);
         } catch (error) {
             console.error(`Failed to register toggleVisibility (${keybinds.toggleVisibility}):`, error);
+        }
+    } else {
+        console.log(`Skipping globalShortcut for toggleVisibility: ${keybinds.toggleVisibility} (handled by Alt tap)`);
+    }
+
+    if (process.platform === 'win32' && keybinds.toggleVisibility === 'Alt') {
+        try {
+            globalShortcut.register('Ctrl+\\', () => {
+                toggleOverlayVisibility(mainWindow);
+            });
+            console.log('Registered fallback toggleVisibility: Ctrl+\\');
+        } catch (error) {
+            console.error('Failed to register fallback toggleVisibility (Ctrl+\\):', error);
         }
     }
 
@@ -346,23 +429,12 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 function setupWindowIpcHandlers(mainWindow, sendToRenderer, geminiSessionRef) {
     ipcMain.on('view-changed', (event, view) => {
         if (!mainWindow.isDestroyed()) {
-            const primaryDisplay = screen.getPrimaryDisplay();
-            const { width: screenWidth } = primaryDisplay.workAreaSize;
-
             if (view === 'assistant') {
-                // Shrink window for live view
-                const liveWidth = 850;
-                const liveHeight = 400;
-                const x = Math.floor((screenWidth - liveWidth) / 2);
-                mainWindow.setSize(liveWidth, liveHeight);
-                mainWindow.setPosition(x, 0);
+                const live = getTopCenteredBounds(850, 400);
+                setWindowFrame(mainWindow, live.width, live.height, live.x, live.y);
             } else {
-                // Restore full size
-                const fullWidth = 1100;
-                const fullHeight = 800;
-                const x = Math.floor((screenWidth - fullWidth) / 2);
-                mainWindow.setSize(fullWidth, fullHeight);
-                mainWindow.setPosition(x, 0);
+                const full = getTopCenteredBounds(1100, 800);
+                setWindowFrame(mainWindow, full.width, full.height, full.x, full.y);
                 mainWindow.setIgnoreMouseEvents(false);
             }
         }
