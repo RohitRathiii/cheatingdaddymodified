@@ -20,6 +20,12 @@ let currentImageQuality = 'medium'; // Store current image quality for manual sc
 
 const isLinux = process.platform === 'linux';
 const isMacOS = process.platform === 'darwin';
+const isWindows = process.platform === 'win32';
+const { resolveBackgroundAlpha } = require('./overlayVisibility');
+
+if (isWindows && document.documentElement) {
+    document.documentElement.classList.add('windows-opaque');
+}
 
 // ============ STORAGE API ============
 // Wrapper for IPC-based storage access
@@ -952,6 +958,7 @@ const theme = {
 
     applyBackgrounds(backgroundColor, alpha = 0.8) {
         const root = document.documentElement;
+        alpha = resolveBackgroundAlpha(process.platform, alpha);
         const baseRgb = this.hexToRgb(backgroundColor);
 
         // For light themes, darken; for dark themes, lighten
@@ -1030,7 +1037,7 @@ const theme = {
         try {
             const prefs = await storage.getPreferences();
             const themeName = prefs.theme || 'dark';
-            const alpha = prefs.backgroundTransparency ?? 0.8;
+            const alpha = resolveBackgroundAlpha(process.platform, prefs.backgroundTransparency ?? 0.8);
             this.apply(themeName, alpha);
             return themeName;
         } catch (err) {
@@ -1084,6 +1091,7 @@ const cheatingDaddy = {
     // Platform detection
     isLinux: isLinux,
     isMacOS: isMacOS,
+    isWindows: isWindows,
 };
 
 // Make it globally available

@@ -36,6 +36,23 @@ function getOverlayRestoreMethod(platform) {
     return platform === 'win32' ? 'show' : 'showInactive';
 }
 
+function shouldUseTransparentOverlay(platform) {
+    return platform !== 'win32';
+}
+
+function getOverlayBackgroundColor(platform) {
+    return platform === 'win32' ? '#0a0a0a' : '#00000000';
+}
+
+function shouldShowWindowOnCreate(platform) {
+    return platform === 'win32';
+}
+
+function resolveBackgroundAlpha(platform, requestedAlpha) {
+    if (platform === 'win32') return 1;
+    return requestedAlpha ?? 0.8;
+}
+
 module.exports = {
     ALT_KEYCODES,
     isAltKeyEvent,
@@ -46,4 +63,8 @@ module.exports = {
     getDefaultToggleVisibility,
     mergeKeybinds,
     getOverlayRestoreMethod,
+    shouldUseTransparentOverlay,
+    getOverlayBackgroundColor,
+    shouldShowWindowOnCreate,
+    resolveBackgroundAlpha,
 };

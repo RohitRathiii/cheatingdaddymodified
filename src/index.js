@@ -14,7 +14,6 @@ if (process.platform === 'darwin') {
 }
 
 if (process.platform === 'win32') {
-    app.commandLine.appendSwitch('enable-transparent-visuals');
     app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 }
 
@@ -40,19 +39,10 @@ app.whenReady().then(async () => {
         desktopCapturer.getSources({ types: ['screen'] }).catch(() => {});
     }
 
-    const startApp = () => {
-        createMainWindow();
-        setupGeminiIpcHandlers(geminiSessionRef);
-        setupStorageIpcHandlers();
-        setupGeneralIpcHandlers();
-    };
-
-    // Transparent always-on-top windows on Windows often fail to paint if created on the same tick as ready.
-    if (process.platform === 'win32') {
-        setTimeout(startApp, 100);
-    } else {
-        startApp();
-    }
+    createMainWindow();
+    setupGeminiIpcHandlers(geminiSessionRef);
+    setupStorageIpcHandlers();
+    setupGeneralIpcHandlers();
 });
 
 app.on('window-all-closed', () => {

@@ -9,6 +9,10 @@ const {
     getDefaultToggleVisibility,
     mergeKeybinds,
     getOverlayRestoreMethod,
+    shouldUseTransparentOverlay,
+    getOverlayBackgroundColor,
+    shouldShowWindowOnCreate,
+    resolveBackgroundAlpha,
 } = require('./overlayVisibility');
 
 test('recognizes left and right Alt keycodes from uiohook', () => {
@@ -72,4 +76,15 @@ test('uses Alt as the Windows hide/show shortcut and migrates the old Ctrl+\\ de
 test('restores a hidden Windows overlay with show instead of showInactive', () => {
     assert.equal(getOverlayRestoreMethod('win32'), 'show');
     assert.equal(getOverlayRestoreMethod('darwin'), 'showInactive');
+});
+
+test('uses an opaque, immediately visible window on Windows', () => {
+    assert.equal(shouldUseTransparentOverlay('win32'), false);
+    assert.equal(shouldUseTransparentOverlay('darwin'), true);
+    assert.equal(getOverlayBackgroundColor('win32'), '#0a0a0a');
+    assert.equal(getOverlayBackgroundColor('darwin'), '#00000000');
+    assert.equal(shouldShowWindowOnCreate('win32'), true);
+    assert.equal(shouldShowWindowOnCreate('darwin'), false);
+    assert.equal(resolveBackgroundAlpha('win32', 0.8), 1);
+    assert.equal(resolveBackgroundAlpha('darwin', 0.8), 0.8);
 });

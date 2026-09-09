@@ -2,7 +2,15 @@ const { BrowserWindow, globalShortcut, ipcMain, screen, Menu } = require('electr
 const path = require('node:path');
 const storage = require('../storage');
 const { startOptionTapMonitor, stopOptionTapMonitor } = require('./optionTapMonitor');
-const { canRegisterGlobalShortcut, getDefaultToggleVisibility, mergeKeybinds, getOverlayRestoreMethod } = require('./overlayVisibility');
+const {
+    canRegisterGlobalShortcut,
+    getDefaultToggleVisibility,
+    mergeKeybinds,
+    getOverlayRestoreMethod,
+    shouldUseTransparentOverlay,
+    getOverlayBackgroundColor,
+    shouldShowWindowOnCreate,
+} = require('./overlayVisibility');
 
 let mouseEventsIgnored = false;
 let stealthHidden = false;
@@ -33,11 +41,6 @@ function hideOverlayWindow(mainWindow) {
 
 function restoreOverlayWindow(mainWindow) {
     if (getOverlayRestoreMethod(process.platform) === 'show') {
-        try {
-            mainWindow.setOpacity(1);
-        } catch (error) {
-            // ignore
-        }
         mainWindow.show();
         mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
         if (typeof mainWindow.moveTop === 'function') {
@@ -112,9 +115,9 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         height: startBounds.height,
         x: startBounds.x,
         y: startBounds.y,
-        show: false,
+        show: shouldShowWindowOnCreate(process.platform),
         frame: false,
-        transparent: true,
+        transparent: shouldUseTransparentOverlay(process.platform),
         hasShadow: false,
         alwaysOnTop: true,
         skipTaskbar: isWin,
@@ -128,7 +131,7 @@ function createWindow(sendToRenderer, geminiSessionRef) {
             webSecurity: true,
             allowRunningInsecureContent: false,
         },
-        backgroundColor: isWin ? '#01000000' : '#00000000',
+        backgroundColor: getOverlayBackgroundColor(process.platform),
     });
 
     const { session, desktopCapturer } = require('electron');
@@ -155,34 +158,24 @@ function createWindow(sendToRenderer, geminiSessionRef) {
 
     if (isWin) {
         mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
-    }
-
-    let overlayReady = false;
-    const revealOverlay = () => {
-        if (overlayReady || mainWindow.isDestroyed()) return;
-        overlayReady = true;
-
-        if (isWin) {
-            try {
-                mainWindow.setOpacity(1);
-            } catch (error) {
-                // ignore
-            }
-            mainWindow.setContentProtection(true);
-            try {
-                mainWindow.setSkipTaskbar(true);
-            } catch (error) {
-                console.warn('Could not hide from taskbar:', error.message);
-            }
-            mainWindow.show();
-            mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
-            if (typeof mainWindow.moveTop === 'function') {
-                mainWindow.moveTop();
-            }
-        } else {
+        mainWindow.setContentProtection(true);
+        try {
+            mainWindow.setSkipTaskbar(true);
+        } catch (error) {
+            console.warn('Could not hide from taskbar:', error.message);
+        }
+        if (!mainWindow.isVisible()) {
             mainWindow.show();
         }
+        if (typeof mainWindow.moveTop === 'function') {
+            mainWindow.moveTop();
+        }
+    }
 
+    let hookStartedForWindow = false;
+    const startHideShortcut = () => {
+        if (hookStartedForWindow || mainWindow.isDestroyed()) return;
+        hookStartedForWindow = true;
         const optionMonitorReady = startOptionTapMonitor(() => {
             toggleOverlayVisibility(mainWindow);
         });
@@ -195,13 +188,27 @@ function createWindow(sendToRenderer, geminiSessionRef) {
         }
     };
 
-    mainWindow.once('ready-to-show', revealOverlay);
-    // Transparent Windows windows sometimes never emit ready-to-show.
-    setTimeout(revealOverlay, isWin ? 400 : 2000);
+    if (isWin) {
+        mainWindow.webContents.once('did-finish-load', startHideShortcut);
+    } else {
+        mainWindow.once('ready-to-show', () => {
+            if (!mainWindow.isDestroyed()) {
+                mainWindow.show();
+            }
+            startHideShortcut();
+        });
+        setTimeout(() => {
+            if (!mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+                mainWindow.show();
+            }
+            startHideShortcut();
+        }, 2000);
+    }
 
     mainWindow.loadFile(path.join(__dirname, '../index.html'));
 
     mainWindow.webContents.once('dom-ready', () => {
+        startHideShortcut();
         setTimeout(() => {
             const defaultKeybinds = getDefaultKeybinds();
             const savedKeybinds = storage.getKeybinds();
