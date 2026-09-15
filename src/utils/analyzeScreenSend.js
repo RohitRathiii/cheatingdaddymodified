@@ -36,8 +36,13 @@ function sendForcedLiveScreenTurn(session, data, prompt) {
     }
 
     try {
+        if (typeof session.sendClientContent === 'function') {
+            session.sendClientContent(buildLiveAnalyzeClientContent(data, prompt));
+            return { success: true, mode: 'client-content' };
+        }
+
         if (typeof session.sendRealtimeInput === 'function') {
-            session.sendRealtimeInput({ media: { data, mimeType: 'image/jpeg' } });
+            session.sendRealtimeInput({ video: { data, mimeType: 'image/jpeg' } });
             const text = String(prompt || '').trim();
             if (text) {
                 session.sendRealtimeInput({ text });

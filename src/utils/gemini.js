@@ -25,6 +25,7 @@ const { createTurnId, emitAnswer } = require('./answerEvents');
 const { buildRelevantContext } = require('./historyStore');
 const { BoundedTurnQueue } = require('./boundedTurnQueue');
 const { connectGeminiLive } = require('./geminiLiveTransport');
+const { buildGeminiLiveSessionConfig, isLiveServerInterrupt } = require('./geminiLiveSessionConfig');
 
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
@@ -56,7 +57,7 @@ let completedTurnsSinceSummary = 0;
 let lastSummaryAt = 0;
 let summaryInFlight = false;
 
-const GEMINI_LIVE_MODEL = 'gemini-3.1-flash-live-preview';
+const GEMINI_LIVE_MODEL = 'gemini-3.8-live';
 
 function createAnswerStream(prefix) {
     const turnId = createTurnId(prefix);
@@ -313,7 +314,6 @@ function initializeNewSession(profile = null, customPrompt = null) {
         customPrompt: customPrompt || '',
     }).catch(error => sendToRenderer('update-status', `History error: ${error.message}`));
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
-
 }
 
 function saveConversationTurn(transcription, aiResponse) {
@@ -454,7 +454,7 @@ async function attachLastScreenshotToLive(session) {
     if (!session || !lastScreenshotJpeg) return;
     try {
         session.sendRealtimeInput({
-            media: {
+            video: {
                 data: lastScreenshotJpeg,
                 mimeType: 'image/jpeg',
             },
@@ -470,6 +470,7 @@ async function getEnabledTools() {
             functionDeclarations: [
                 {
                     name: 'search_meeting',
+                    behavior: 'BLOCKING',
                     description: 'Search earlier meeting transcripts and screen analyses for facts relevant to a question.',
                     parameters: {
                         type: 'OBJECT',
@@ -865,6 +866,23 @@ function handleLiveTurnComplete() {
     sendToRenderer('update-status', 'Listening...');
 }
 
+function handleLiveInterrupted() {
+    clearTranscriptionSilenceTimer();
+    clearLateTranscriptionTimer();
+    awaitingLateTranscript = false;
+    const input = currentTranscription.trim();
+    const output = liveOutputText.trim();
+    if (output) {
+        if (!liveTurnId) liveTurnId = createTurnId('live');
+        emitAnswer(sendToRenderer, liveTurnId, 'interrupted', output, liveOutputSequence++);
+        saveConversationTurn(input || '(interrupted audio)', output);
+    }
+    resetLiveConversationBuffers();
+    liveTurnActive = false;
+    dispatchNextTypedTurn();
+    sendToRenderer('update-status', 'Listening...');
+}
+
 function resampleLive24kTo16k(inputBuffer) {
     const combined = Buffer.concat([liveResampleRemainder, inputBuffer]);
     const inputSamples = Math.floor(combined.length / 2);
@@ -1179,6 +1197,11 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         return;
                     }
 
+                    if (isLiveServerInterrupt(message)) {
+                        handleLiveInterrupted();
+                        return;
+                    }
+
                     ingestLiveInputTranscription(message);
                     ingestLiveOutputTranscription(message);
 
@@ -1216,39 +1239,13 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     }
                 },
             },
-            config: {
-                generationConfig: {
-                    responseModalities: ['AUDIO'],
-                    thinkingConfig: { thinkingLevel: 'MINIMAL' },
-                    mediaResolution: 'MEDIA_RESOLUTION_MEDIUM',
-                    speechConfig: { languageCode: language },
-                },
-                sessionResumption: sessionResumptionHandle ? { handle: sessionResumptionHandle } : {},
-                outputAudioTranscription: {
-                    languageCodes: language ? [language] : ['en-US'],
-                },
+            config: buildGeminiLiveSessionConfig({
+                language,
+                vadPreset: getPreferences().vadPreset,
                 tools: enabledTools,
-                inputAudioTranscription: {
-                    languageCodes: language ? [language] : ['en-US'],
-                },
-                realtimeInputConfig: {
-                    automaticActivityDetection: {
-                        disabled: false,
-                        startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-                        endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-                        prefixPaddingMs: 300,
-                        silenceDurationMs: getPreferences().vadPreset === 'patient' ? 1200 : 800,
-                    },
-                    turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY',
-                },
-                contextWindowCompression: {
-                    triggerTokens: '20000',
-                    slidingWindow: { targetTokens: '8000' },
-                },
-                systemInstruction: {
-                    parts: [{ text: systemPrompt }],
-                },
-            },
+                systemPrompt,
+                sessionResumptionHandle,
+            }),
         });
 
         if (!liveConnections.isCurrent(connectionGeneration)) {
@@ -1757,7 +1754,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US') => {
         currentProviderMode = 'byok';
 
-        // Gemini Live 3.1 conversational path (STT + overlay answer in one session)
+        // Gemini Live 3.8 conversational path (STT + overlay answer in one session)
         const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
         if (session) {
             geminiSessionRef.current = session;

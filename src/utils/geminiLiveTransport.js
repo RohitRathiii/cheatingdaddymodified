@@ -28,6 +28,10 @@ class GeminiLiveTransport {
         this.sendEnvelope({ realtimeInput: input });
     }
 
+    sendClientContent(content) {
+        this.sendEnvelope({ clientContent: content });
+    }
+
     sendToolResponse(response) {
         this.sendEnvelope({ toolResponse: response });
     }

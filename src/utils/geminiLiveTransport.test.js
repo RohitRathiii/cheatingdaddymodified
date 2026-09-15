@@ -24,8 +24,10 @@ test('uses public Live setup/realtime envelopes and exposes socket buffering', (
     const transport = new GeminiLiveTransport(socket, {});
     transport.sendSetup({ model: 'models/test', generationConfig: { responseModalities: ['AUDIO'] } });
     transport.sendRealtimeInput({ audio: { data: 'abc', mimeType: 'audio/pcm;rate=16000' } });
+    transport.sendClientContent({ turns: [{ role: 'user', parts: [{ text: 'hi' }] }], turnComplete: true });
     assert.deepEqual(socket.sent[0], { setup: { model: 'models/test', generationConfig: { responseModalities: ['AUDIO'] } } });
     assert.deepEqual(socket.sent[1], { realtimeInput: { audio: { data: 'abc', mimeType: 'audio/pcm;rate=16000' } } });
+    assert.deepEqual(socket.sent[2], { clientContent: { turns: [{ role: 'user', parts: [{ text: 'hi' }] }], turnComplete: true } });
     socket.bufferedAmount = 1234;
     assert.equal(transport.bufferedBytes, 1234);
 });
