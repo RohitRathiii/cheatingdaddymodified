@@ -4,8 +4,6 @@ const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
 const {
-    getAvailableModel,
-    incrementLimitCount,
     getApiKey,
     getGroqApiKey,
     incrementCharUsage,
@@ -18,7 +16,12 @@ const {
 } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { captureScreenStill } = require('./screenStill');
-const { chooseAnalyzeScreenPath, sendForcedLiveScreenTurn } = require('./analyzeScreenSend');
+const {
+    chooseAnalyzeScreenPath,
+    sendForcedLiveScreenTurn,
+    buildScreenAnalysisRequest,
+    buildLiveScreenContextContent,
+} = require('./analyzeScreenSend');
 const { BoundedAudioQueue, validateAudioFrame } = require('./audioPipeline');
 const { ConnectionGeneration } = require('./connectionGeneration');
 const { createTurnId, emitAnswer } = require('./answerEvents');
@@ -482,7 +485,7 @@ Reply in markdown only, with no preamble, in exactly this shape:
 
 One fenced code block with a language tag containing the complete, runnable solution, properly indented, with brief comments only where they help.
 
-**Complexity**: time and space on one line.
+**Complexity**: time and space on one line, in plain text such as O(n log n) with no LaTeX or $ signs.
 
 Use the language the question asks for; otherwise the language used earlier in the conversation; otherwise Python.`;
 let codeAnswerClient = null;
@@ -502,7 +505,8 @@ function claimLiveCardForCode() {
     return liveTurnId;
 }
 
-function getCodeAnswerClient(apiKey) {
+// Shared by the code card and screen analysis so the HTTPS connection stays warm.
+function getTextModelClient(apiKey) {
     if (!codeAnswerClient || codeAnswerClientKey !== apiKey) {
         codeAnswerClient = new GoogleGenAI({ apiKey });
         codeAnswerClientKey = apiKey;
@@ -545,7 +549,7 @@ async function sendCodeAnswer(question, turnId) {
     parts.push({ text: `${userContext}${context ? `Conversation so far:\n${context}\n\n` : ''}Question:\n${question}` });
 
     try {
-        const stream = await getCodeAnswerClient(apiKey).models.generateContentStream({
+        const stream = await getTextModelClient(apiKey).models.generateContentStream({
             model: CODE_ANSWER_MODEL,
             contents: [{ role: 'user', parts }],
             config: {
@@ -1764,52 +1768,30 @@ async function sendImageToGroqLlama4(base64Data, prompt) {
     }
 }
 
-async function sendImageToGeminiHttp(base64Data, prompt) {
-    const answer = createAnswerStream('screen-gemini');
-    // Get available model based on rate limits
-    const model = getAvailableModel();
-
+async function sendImageToGeminiHttp(base64Data, request) {
     const apiKey = getApiKey();
     if (!apiKey) {
         return { success: false, error: 'No API key configured' };
     }
 
+    const answer = createAnswerStream('screen-gemini');
+    const records = [...conversationHistory, ...screenAnalysisHistory].sort((a, b) => a.timestamp - b.timestamp);
+    const context = buildRelevantContext({ query: request, summary: currentSummary, records });
+    const screenRequest = buildScreenAnalysisRequest({ data: base64Data, request, context });
+
     try {
-        const ai = new GoogleGenAI({ apiKey: apiKey });
+        console.log(`Sending image to ${screenRequest.model} (streaming)...`);
+        const response = await getTextModelClient(apiKey).models.generateContentStream(screenRequest);
 
-        const contents = [
-            {
-                inlineData: {
-                    mimeType: 'image/jpeg',
-                    data: base64Data,
-                },
-            },
-            { text: prompt },
-        ];
-
-        console.log(`Sending image to ${model} (streaming)...`);
-        const response = await ai.models.generateContentStream({
-            model: model,
-            contents: contents,
-        });
-
-        // Increment count after successful call
-        incrementLimitCount(model);
-
-        // Stream the response
         let fullText = '';
-        let isFirst = true;
         for await (const chunk of response) {
-            const chunkText = chunk.text;
-            if (chunkText) {
-                fullText += chunkText;
-                // Send to renderer - new response for first chunk, update for subsequent
+            if (chunk.text) {
+                fullText += chunk.text;
                 answer.update(fullText);
-                isFirst = false;
             }
         }
 
-        console.log(`Image response completed from ${model}`);
+        console.log(`Image response completed from ${screenRequest.model}`);
 
         if (!fullText.trim()) {
             return { success: false, error: 'Screen analysis returned no text' };
@@ -1817,20 +1799,17 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         answer.complete(fullText.trim());
 
         // Inject screen analysis into Groq context for follow-up voice questions
-        if (fullText.trim()) {
-            groqConversationHistory.push({
-                role: 'user',
-                content: `[Screen context]: ${fullText.trim()}`,
-            });
-            if (groqConversationHistory.length > 20) {
-                groqConversationHistory = groqConversationHistory.slice(-20);
-            }
+        groqConversationHistory.push({
+            role: 'user',
+            content: `[Screen context]: ${fullText.trim()}`,
+        });
+        if (groqConversationHistory.length > 20) {
+            groqConversationHistory = groqConversationHistory.slice(-20);
         }
 
-        // Save screen analysis to history
-        saveScreenAnalysis(prompt, fullText, model);
+        saveScreenAnalysis(request || 'Analyze Screen', fullText, screenRequest.model);
 
-        return { success: true, text: fullText, model: model };
+        return { success: true, text: fullText, model: screenRequest.model };
     } catch (error) {
         console.error('Error sending image to Gemini HTTP:', error);
         return { success: false, error: error.message };
@@ -1998,9 +1977,13 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
 
             rememberScreenshot(data);
-            pendingTypedQuestion = 'Analyze Screen';
-            const analyzePrompt = composeUserTurn(prompt || 'Analyze this screenshot now. Give the complete answer from what you see.');
             sendToRenderer('update-status', 'Analyzing screen...');
+            // Paths whose answer is saved through saveConversationTurn label it "Analyze Screen";
+            // the HTTP path saves its own screen record, so it must not leave this for the next voice turn.
+            const liveScreenPrompt = () => {
+                pendingTypedQuestion = 'Analyze Screen';
+                return composeUserTurn(prompt || 'Analyze this screenshot now. Give the complete answer from what you see.');
+            };
 
             const analyzePath = chooseAnalyzeScreenPath({
                 providerMode: currentProviderMode,
@@ -2011,7 +1994,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
             if (analyzePath === 'cloud') {
                 const sentImage = sendCloudImage(data);
-                const sentText = sendCloudText(analyzePrompt);
+                const sentText = sendCloudText(liveScreenPrompt());
                 if (!sentImage || !sentText) {
                     return { success: false, error: 'Cloud connection not active' };
                 }
@@ -2019,32 +2002,42 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
 
             if (analyzePath === 'local') {
-                return await getLocalAi().sendLocalImage(data, analyzePrompt);
+                return await getLocalAi().sendLocalImage(data, liveScreenPrompt());
             }
 
             if (analyzePath === 'http') {
-                const result = await sendImageToGeminiHttp(data, analyzePrompt);
+                const result = await sendImageToGeminiHttp(data, prompt);
+                const session = geminiSessionRef.current;
                 if (result.success && result.text?.trim()) {
-                    if (geminiSessionRef.current) {
-                        await attachLastScreenshotToLive(geminiSessionRef.current);
+                    // Send once: Live gets the screen as context for voice follow-ups but is not asked to answer it.
+                    if (session && typeof session.sendClientContent === 'function') {
+                        try {
+                            session.sendClientContent(buildLiveScreenContextContent(data, result.text));
+                        } catch (error) {
+                            console.warn('Could not share screen context with Live:', error.message);
+                        }
                     }
                     return result;
                 }
-                if (geminiSessionRef.current) {
-                    const liveResult = sendImageToGeminiLive(geminiSessionRef.current, data, analyzePrompt);
+                if (session) {
+                    const liveResult = sendImageToGeminiLive(session, data, liveScreenPrompt());
                     if (liveResult.success) {
                         return liveResult;
                     }
+                    pendingTypedQuestion = null;
                 }
                 return result.success === false ? result : { success: false, error: 'Screen analysis returned no text' };
             }
 
             if (analyzePath === 'live') {
-                return sendImageToGeminiLive(geminiSessionRef.current, data, analyzePrompt);
+                return sendImageToGeminiLive(geminiSessionRef.current, data, liveScreenPrompt());
             }
 
             if (analyzePath === 'groq') {
-                return await sendImageToGroqLlama4(data, analyzePrompt);
+                return await sendImageToGroqLlama4(
+                    data,
+                    composeUserTurn(prompt || 'Analyze this screenshot now. Give the complete answer from what you see.')
+                );
             }
 
             return { success: false, error: 'No active Gemini session' };

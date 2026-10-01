@@ -60,3 +60,31 @@ test('sendForcedLiveScreenTurn falls back to realtime video and text', () => {
     assert.equal(result.mode, 'realtime');
     assert.deepEqual(calls, [{ video: { data: 'img', mimeType: 'image/jpeg' } }, { text: 'Read this' }]);
 });
+
+test('screen analysis uses gemini-3.8-flash with instructions in the system prompt', () => {
+    const { buildScreenAnalysisRequest, SCREEN_ANALYSIS_INSTRUCTION } = require('./analyzeScreenSend');
+    const request = buildScreenAnalysisRequest({ data: 'img', request: 'Solve this', context: 'x'.repeat(5000) + 'TAIL' });
+    assert.equal(request.model, 'gemini-3.8-flash');
+    assert.deepEqual(request.config.thinkingConfig, { thinkingLevel: 'LOW' });
+    assert.equal(request.config.systemInstruction, SCREEN_ANALYSIS_INSTRUCTION);
+    const [image, text] = request.contents[0].parts;
+    assert.deepEqual(image, { inlineData: { mimeType: 'image/jpeg', data: 'img' } });
+    assert.ok(text.text.endsWith('Request: Solve this'));
+    assert.ok(text.text.includes('TAIL'));
+    assert.ok(text.text.length < 3100);
+    assert.equal(text.text.includes('Approach'), false);
+});
+
+test('screen analysis falls back to a default request without context', () => {
+    const { buildScreenAnalysisRequest } = require('./analyzeScreenSend');
+    const request = buildScreenAnalysisRequest({ data: 'img' });
+    assert.equal(request.contents[0].parts[1].text, 'Request: Answer the question or task shown on this screenshot.');
+});
+
+test('Live screen context adds the image and analysis without completing a turn', () => {
+    const { buildLiveScreenContextContent } = require('./analyzeScreenSend');
+    const payload = buildLiveScreenContextContent('img', ' The answer is B. ');
+    assert.equal(payload.turnComplete, false);
+    assert.deepEqual(payload.turns[0].parts[0], { inlineData: { mimeType: 'image/jpeg', data: 'img' } });
+    assert.equal(payload.turns[0].parts[1].text, '[Screen analysis shown to the user]\nThe answer is B.');
+});
