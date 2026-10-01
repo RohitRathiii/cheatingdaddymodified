@@ -1,6 +1,11 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { buildGeminiLiveSessionConfig, isLiveServerInterrupt } = require('./geminiLiveSessionConfig');
+const {
+    buildGeminiLiveSessionConfig,
+    isLiveServerInterrupt,
+    LIVE_ALWAYS_RESPOND_INSTRUCTION,
+    LIVE_CODE_HANDOFF_INSTRUCTION,
+} = require('./geminiLiveSessionConfig');
 
 function serialized(config) {
     return JSON.stringify(config);
@@ -24,7 +29,7 @@ test('builds a 3.8 Live setup without thinking or speech language codes', () => 
     assert.equal(config.generationConfig.mediaResolution, 'MEDIA_RESOLUTION_HIGH');
     assert.deepEqual(config.outputAudioTranscription.languageCodes, ['en-US']);
     assert.deepEqual(config.inputAudioTranscription.languageCodes, ['en-US']);
-    assert.equal(config.systemInstruction.parts[0].text, 'Be brief.');
+    assert.equal(config.systemInstruction.parts[0].text, `Be brief.\n\n${LIVE_ALWAYS_RESPOND_INSTRUCTION}\n\n${LIVE_CODE_HANDOFF_INSTRUCTION}`);
 });
 
 test('uses video turn coverage, barge-in, and a 20ms VAD prefix', () => {

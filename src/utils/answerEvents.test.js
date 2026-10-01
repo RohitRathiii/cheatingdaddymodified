@@ -21,3 +21,11 @@ test('creates unique turn ids without transcript content', () => {
     assert.notEqual(createTurnId('live'), createTurnId('live'));
     assert.match(createTurnId('screen'), /^screen-/);
 });
+
+test('a code answer with a higher sequence base takes over the spoken answer card', () => {
+    let state = { responses: [], turnIds: [] };
+    state = applyAnswerEvent(state, { turnId: 'live', event: 'start', text: 'Spoken summary', sequence: 0 });
+    state = applyAnswerEvent(state, { turnId: 'live', event: 'update', text: '```java\ncode\n```', sequence: 1000000 });
+    state = applyAnswerEvent(state, { turnId: 'live', event: 'complete', text: 'Spoken summary, longer', sequence: 1 });
+    assert.deepEqual(state.responses, ['```java\ncode\n```']);
+});

@@ -165,7 +165,8 @@ export class AssistantView extends LitElement {
         }
 
         .response-container pre {
-            background: var(--bg-surface);
+            /* Fixed dark editor background so the token colours below stay readable in every theme */
+            background: #1e1e1e;
             border: 1px solid var(--border);
             border-radius: var(--radius-md);
             padding: var(--space-md);
@@ -174,8 +175,60 @@ export class AssistantView extends LitElement {
         }
 
         .response-container pre code {
+            display: block;
             background: none;
             padding: 0;
+            font-size: 0.85em;
+            line-height: 1.55;
+            white-space: pre;
+            tab-size: 4;
+            color: #d4d4d4;
+        }
+
+        /* Section labels such as **Question**: / **Answer**: / **Why**: start their own paragraph */
+        .answer-body p > strong:first-child {
+            color: var(--accent);
+            font-size: 0.75em;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+
+        /* highlight.js tokens (the global theme does not reach this shadow root) */
+        .response-container .hljs-keyword,
+        .response-container .hljs-literal,
+        .response-container .hljs-symbol {
+            color: #569cd6;
+        }
+        .response-container .hljs-built_in,
+        .response-container .hljs-type,
+        .response-container .hljs-title.class_ {
+            color: #4ec9b0;
+        }
+        .response-container .hljs-title,
+        .response-container .hljs-title.function_ {
+            color: #dcdcaa;
+        }
+        .response-container .hljs-string,
+        .response-container .hljs-regexp {
+            color: #ce9178;
+        }
+        .response-container .hljs-number {
+            color: #b5cea8;
+        }
+        .response-container .hljs-comment,
+        .response-container .hljs-quote {
+            color: #6a9955;
+            font-style: italic;
+        }
+        .response-container .hljs-variable,
+        .response-container .hljs-params,
+        .response-container .hljs-attr,
+        .response-container .hljs-property {
+            color: #9cdcfe;
+        }
+        .response-container .hljs-meta,
+        .response-container .hljs-doctag {
+            color: #c586c0;
         }
 
         .response-container a {
@@ -380,6 +433,16 @@ export class AssistantView extends LitElement {
                     breaks: true,
                     gfm: true,
                     sanitize: false,
+                    langPrefix: 'hljs language-',
+                    highlight: (code, lang) => {
+                        const hljs = window.hljs;
+                        if (!hljs) return code;
+                        try {
+                            return lang && hljs.getLanguage(lang) ? hljs.highlight(code, { language: lang }).value : hljs.highlightAuto(code).value;
+                        } catch (_) {
+                            return code;
+                        }
+                    },
                 });
                 if (this._markdownCache.has(content)) return this._markdownCache.get(content);
                 const rendered = window.marked.parse(content);
